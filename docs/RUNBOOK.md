@@ -9,6 +9,12 @@
 Логи: `/home/fx/copier/logs/copier.log`, `journalctl -u fx-mt5 -u fx-bridge -u fx-copier`.
 Журнал терминала: `/home/fx/.wine/drive_c/Program Files/FxPro Markets MT5/logs/<дата>.log` (UTF-16: `iconv -c -f UTF-16LE -t UTF-8`).
 
+## Если в группе «🛡 СДЕЛКА ОСТАНОВЛЕНА ЗАЩИТОЙ» / «🛡 ЗАЩИТА: торговля на паузе»
+
+Новые сигналы не исполняются, пока не нажата кнопка. Открытые сделки ведутся дальше.
+Нажать нужное под сообщением бота; если кнопок нет — `/approve`, `/approve_safe`, `/reject`, `/resume`.
+Пороги — секция `guard:` в `config.yaml` (после правки `systemctl restart fx-copier`).
+
 ## Если в группе «🚨 Нет связи с MT5»
 
 Стопы/тейки стоят на сервере брокера и работают. Не работают новые входы и перенос в БУ.

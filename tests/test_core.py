@@ -5,6 +5,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from parser import parse_signal, parse_command  # noqa: E402
 from trader import decide_entry, plan_positions, lot_from_table  # noqa: E402
+import guard as G  # noqa: E402
 
 SIGNALS = {
     "GOLD BUY\nBUY @ 4506-4498\nTF: 1M\n✅TP1: 4510\n✅TP2: 4513\n✅TP3: 4521\n✅TP4: 4536\n❌SL: 4483": ("BUY", True),
@@ -50,7 +51,24 @@ def test_lots():
     assert plan_positions(0.025, [1, 2, 3], 0.01, 0.01) == [(1, .01), (3, .01)]
 
 
+def test_guard():
+    g = G.settings({})
+    base = dict(symbol_key="GOLD", plan_lot=0.03, table_lot=0.05, sl_distance=17, balance=1000,
+                free_margin=1000, margin_needed=126, open_risk=0, recent_signals=[])
+    assert G.check_trade(g, plan_risk=51, **base) == []                       # обычная сделка 5%
+    assert G.check_trade(g, plan_risk=150, **base)                            # 15% — опасно
+    assert G.check_trade(g, plan_risk=51, **{**base, "sl_distance": 120})     # стоп $120
+    assert G.check_trade(g, plan_risk=51, **{**base, "plan_lot": 0.6})        # лот выше потолка
+    assert G.check_trade(g, plan_risk=51, **{**base, "open_risk": 110})       # суммарно 16%
+    assert G.check_account(g, last_pnls=[5, -10, -20, -30], equity=900, peak_balance=1000)
+    assert not G.check_account(g, last_pnls=[-10, -20, 5], equity=900, peak_balance=1000)
+    assert G.check_account(g, last_pnls=[], equity=700, peak_balance=1000)
+    assert G.sl_move_increases_risk("BUY", 4300, 4290, 4280)
+    assert not G.sl_move_increases_risk("BUY", 4300, 4290, 4295)
+    assert G.sl_move_increases_risk("SELL", 4300, 4310, 4320)
+
+
 if __name__ == "__main__":
-    for f in (test_signals, test_commands, test_entry, test_lots):
+    for f in (test_signals, test_commands, test_entry, test_lots, test_guard):
         f()
     print("OK")

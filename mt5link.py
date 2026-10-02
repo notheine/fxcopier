@@ -83,6 +83,9 @@ class MT5Link:
         r = self.m.orders_get(symbol=symbol) if symbol else self.m.orders_get()
         return list(r) if r else []
 
+    def order_calc_margin(self, order_type, symbol, volume, price):
+        return self.m.order_calc_margin(order_type, symbol, volume, price)
+
     def history_deals_get(self, ts_from: int, ts_to: int):
         r = self.m.history_deals_get(int(ts_from), int(ts_to))
         return list(r) if r else []

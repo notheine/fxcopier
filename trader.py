@@ -172,44 +172,62 @@ class Trader:
         return total, reduce
 
     # ---- открытие
-    def open_signal(self, sid: int, sig, dry_run=False):
+    def prepare(self, sid: int, sig, max_lot: float = None):
         """
-        Открывает позиции/лимитки по сигналу.
-        Возвращает (список {ticket,k,kind}, текст отчёта).
+        План сделки без отправки ордеров: (plan | None, текст).
+        plan содержит всё для проверки риска и исполнения.
         """
         key = sig.symbol
         name = self.symbol(key)
         if name is None:
-            return [], f"инструмент {key} отключён в настройках — пропускаю"
+            return None, f"инструмент {key} отключён в настройках — пропускаю"
         sc = self.scfg(key)
         info = self.mt5.symbol_info(name)
         tick = self.mt5.symbol_info_tick(name)
         if tick is None or tick.bid <= 0:
-            return [], f"нет котировок {name} (рынок закрыт?) — пропускаю"
+            return None, f"нет котировок {name} (рынок закрыт?) — пропускаю"
         spread = tick.ask - tick.bid
         if spread > sc.get("max_spread", 1e9):
-            return [], f"спред {spread:.2f} больше допустимого {sc['max_spread']} — пропускаю"
+            return None, f"спред {spread:.2f} больше допустимого {sc['max_spread']} — пропускаю"
 
         stops_gap = max(int(info.trade_stops_level), 0) * info.point
         min_gap = max(stops_gap, spread * 2, sc.get("min_sl_gap", 0))
         action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap)
         if action == "skip":
-            return [], f"не вхожу: {why}"
+            return None, f"не вхожу: {why}"
 
         total, reduced = self.lot_total(sig)
-        plan = plan_positions(total, list(sig.tps), info.volume_min, info.volume_step)
-        if not plan:
-            return [], f"лот {total:.3f} меньше минимального {info.volume_min} — пропускаю"
-
-        lots = " + ".join(f"{v:g}" for _, v in plan)
+        table_lot = total
+        if max_lot is not None:
+            total = min(total, max_lot)
+        positions = plan_positions(total, list(sig.tps), info.volume_min, info.volume_step)
+        if not positions:
+            return None, f"лот {total:.3f} меньше минимального {info.volume_min} — пропускаю"
+        lot = round(sum(v for _, v in positions), 8)
+        sl_dist = abs(price - sig.sl)
+        risk = self.money(info, lot, sl_dist)
+        margin = None
+        try:
+            mtype = self.mt5.ORDER_TYPE_BUY if sig.side == "BUY" else self.mt5.ORDER_TYPE_SELL
+            margin = self.mt5.order_calc_margin(mtype, name, float(lot), float(price))
+        except Exception:
+            pass
+        lots = " + ".join(f"{v:g}" for _, v in positions)
         head = (f"{'ВХОД ПО РЫНКУ' if action == 'market' else 'ЛИМИТНЫЙ ОРДЕР'} {name} {sig.side} "
-                f"@ {price:g} ({why}); лот {lots}" + (" (уменьшен вдвое)" if reduced else ""))
-        if dry_run:
-            return [], "[тест, без ордеров] " + head
+                f"@ {price:g} ({why}); лот {lots}" + (" (уменьшен вдвое)" if reduced else "")
+                + (" (уменьшен защитой по вашему решению)" if max_lot is not None else ""))
+        plan = {"sid": sid, "sig": sig, "name": name, "info": info, "sc": sc, "action": action, "price": price,
+                "positions": positions, "lot": lot, "table_lot": table_lot, "sl_distance": sl_dist,
+                "risk": risk, "margin": margin, "head": head}
+        return plan, head
 
+    def execute(self, plan):
+        """Отправляет ордера по плану. Возвращает (список {ticket,k,kind,...}, отчёт)."""
+        sig, name, info, sc, action, price = (plan[k] for k in ("sig", "name", "info", "sc", "action", "price"))
+        sid = plan["sid"]
         buy = sig.side == "BUY"
         out, errs = [], []
-        for k, vol in plan:
+        for k, vol in plan["positions"]:
             req = {
                 "symbol": name,
                 "volume": float(vol),
@@ -241,12 +259,41 @@ class Trader:
                             "price": float(res.price or req["price"])})
             else:
                 errs.append(f"TP{k}: {err}")
-        rep = head
+        rep = plan["head"]
         if out and action == "market":
             rep += "\nИсполнено: " + ", ".join(f"TP{o['k']} {o['volume']:g} @ {o['price']:g}" for o in out)
         if errs:
             rep += "\n⚠️ Ошибки: " + "; ".join(errs)
         return out, rep
+
+    def open_signal(self, sid: int, sig, dry_run=False):
+        """Подготовить и сразу исполнить (без проверки риска). Возвращает (ордера, отчёт)."""
+        plan, text = self.prepare(sid, sig)
+        if plan is None:
+            return [], text
+        if dry_run:
+            return [], "[тест, без ордеров] " + text
+        return self.execute(plan)
+
+    # ---- деньги и риск
+    def money(self, info, volume, distance):
+        """Сколько денег = движение цены на distance при объёме volume."""
+        ts, tv = float(getattr(info, "trade_tick_size", 0) or 0), float(getattr(info, "trade_tick_value", 0) or 0)
+        if ts > 0 and tv > 0:
+            return volume * distance / ts * tv
+        return volume * distance * float(getattr(info, "trade_contract_size", 100) or 100)
+
+    def open_risk(self):
+        """Сколько потеряем, если все открытые позиции копировщика закроются по стопу (БУ = 0)."""
+        total = 0.0
+        for p in self.mt5.positions_get():
+            if p.magic != self.magic or not p.sl:
+                continue
+            s = 1 if p.type == self.mt5.POSITION_TYPE_BUY else -1
+            dist = s * (p.price_open - p.sl)
+            if dist > 0:
+                total += self.money(self.mt5.symbol_info(p.symbol), p.volume, dist)
+        return total
 
     # ---- поиск своих позиций/ордеров
     def positions_of(self, rec):

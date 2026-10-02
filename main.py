@@ -15,8 +15,9 @@ from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 
 import yaml
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 
+import guard as G
 from parser import parse_signal, parse_command, looks_like_signal
 from mt5link import MT5Link
 from trader import Trader
@@ -78,11 +79,14 @@ channel_entity = None
 mt5_ok = False
 
 
-async def notify(text: str):
+async def notify(text: str, buttons=None, alt=""):
+    """Отчёт в группу (от бота). buttons — кнопки; alt — текстовая подсказка, если бота нет."""
     log.info("NOTIFY: %s", text.replace("\n", " | "))
     try:
         if bot:
-            await bot.send_message(REPORT_CHAT, text[:4000])
+            await bot.send_message(REPORT_CHAT, text[:4000], buttons=buttons)
+        elif buttons and alt:
+            await client.send_message(notify_peer or NOTIFY, (text + "\n\n" + alt)[:4000])
         else:
             await client.send_message(notify_peer or NOTIFY, text[:4000])
     except Exception as e:
@@ -95,6 +99,9 @@ def now_msk():
 
 def entries_blocked():
     """Причина, по которой новые входы запрещены, или None."""
+    h = state.d.get("hold")
+    if h and h.get("type") in ("trade", "account"):
+        return "защита ждёт вашего решения (кнопки в группе)"
     if state.d["paused"]:
         return "копировщик на паузе (/resume чтобы продолжить)"
     if state.d["day_paused"]:
@@ -165,6 +172,8 @@ async def handle_signal(msg, text, sig):
         state.save()
         await notify(head + f"\n⏭ Сигнал пришёл с опозданием {age:.0f} с — пропускаю.")
         return
+    times = [t for t in state.d.get("sig_times", []) if time.time() - t < 3600]
+    state.d["sig_times"] = times + [time.time()]
     why = entries_blocked()
     if why:
         rec["reason"] = why.split(" —")[0].split(" (")[0]
@@ -174,10 +183,35 @@ async def handle_signal(msg, text, sig):
         return
 
     try:
-        orders, rep = trader.open_signal(msg.id, sig, dry_run=DRY)
+        plan, text_plan = trader.prepare(msg.id, sig)
     except Exception as e:
-        log.exception("ошибка открытия")
-        orders, rep = [], f"⚠️ Ошибка: {e}"
+        log.exception("ошибка подготовки")
+        plan, text_plan = None, f"⚠️ Ошибка: {e}"
+    reasons = guard_trade(plan, times) if plan else []
+    if plan and DRY:
+        rec["reason"] = "тестовый режим"
+        state.signals[sid] = rec
+        state.save()
+        extra = ("\n🛡 Защита остановила бы: " + "; ".join(reasons)) if reasons else ""
+        await notify(head + "\nℹ️ [тест, без ордеров] " + text_plan + extra)
+        return
+    if plan and reasons:
+        rec["status"] = "held"
+        rec["reason"] = "остановлено защитой"
+        state.signals[sid] = rec
+        state.d["hold"] = {"type": "trade", "sid": sid, "reasons": reasons, "created": time.time()}
+        state.save()
+        await ask_trade(rec, plan, reasons, head)
+        return
+    if plan:
+        orders, rep = trader.execute(plan)
+    else:
+        orders, rep = [], text_plan
+    await finish_open(rec, sig, orders, rep, head)
+
+
+async def finish_open(rec, sig, orders, rep, head):
+    sid = str(rec["id"])
     if orders:
         rec["status"] = "active"
         rec["orders"] = orders
@@ -191,6 +225,140 @@ async def handle_signal(msg, text, sig):
     state.signals[sid] = rec
     state.save()
     await notify(head + "\n" + ("✅ " if orders else "ℹ️ ") + rep)
+
+
+# ------------------------------------------------------------------ защита (второй слой)
+
+def guard_trade(plan, recent_times):
+    acc = trader.account()
+    return G.check_trade(
+        G.settings(CFG), symbol_key=plan["sig"].symbol, plan_risk=plan["risk"], plan_lot=plan["lot"],
+        table_lot=plan["table_lot"], sl_distance=plan["sl_distance"], balance=acc.balance,
+        free_margin=getattr(acc, "margin_free", 0.0), margin_needed=plan["margin"],
+        open_risk=trader.open_risk(), recent_signals=recent_times)
+
+
+def guard_buttons(kind, sid):
+    if kind == "trade":
+        return [[Button.inline("✅ Открыть как есть", f"g:ok:{sid}".encode()),
+                 Button.inline("⚖️ С безопасным лотом", f"g:safe:{sid}".encode())],
+                [Button.inline("❌ Пропустить", f"g:no:{sid}".encode())]]
+    if kind == "account":
+        return [[Button.inline("▶️ Продолжить торговлю", b"g:resume:0"),
+                 Button.inline("⏸ Оставить на паузе", b"g:keep:0")]]
+    if kind == "sl":
+        return [[Button.inline("✅ Перенести стоп", f"g:slok:{sid}".encode()),
+                 Button.inline("❌ Оставить прежний", f"g:slno:{sid}".encode())]]
+
+
+async def ask_trade(rec, plan, reasons, head):
+    acc = trader.account()
+    ttl = G.settings(CFG)["approval_ttl_min"]
+    await notify(
+        f"{head}\n🛡 СДЕЛКА ОСТАНОВЛЕНА ЗАЩИТОЙ — выглядит опасной:\n• " + "\n• ".join(reasons)
+        + f"\n\nПлан: {plan['head']}\nРиск при стопе: {plan['risk']:.2f} {acc.currency} из баланса {acc.balance:.2f}"
+        + f"\n⏸ Новые сигналы на паузе до вашего решения. Разрешение действует {ttl} мин "
+          f"(потом цена устареет — сделку не открою, просто продолжу работу).",
+        buttons=guard_buttons("trade", rec["id"]),
+        alt="Ответьте: /approve — открыть, /approve_safe — с безопасным лотом, /reject — пропустить")
+
+
+async def guard_account_check():
+    """Пауза по состоянию счёта: серия убытков, большая просадка. Плюс истечение вопросов по сделкам."""
+    h = state.d.get("hold")
+    if h and h["type"] == "trade" and time.time() - h["created"] > G.settings(CFG)["approval_ttl_min"] * 60:
+        rec = state.signals.get(str(h["sid"]))
+        if rec:
+            rec["status"], rec["reason"] = "skipped", "нет ответа на вопрос защиты"
+        state.d["hold"] = {"type": "account", "sid": 0, "created": time.time(),
+                           "reasons": [f"не было ответа по сигналу #{h['sid']}"]}
+        state.save()
+        await notify(f"⌛️ Ответа по сигналу #{h['sid']} не было {G.settings(CFG)['approval_ttl_min']} мин — "
+                     "сделку не открываю (цена устарела). Торговля на паузе до вашего решения.",
+                     buttons=guard_buttons("account", 0), alt="Ответьте /resume — продолжить торговлю")
+        return
+    if h or not trader:
+        return
+    acc = trader.account()
+    peak = max(state.d.get("peak_balance") or 0, acc.balance)
+    if peak != state.d.get("peak_balance"):
+        state.d["peak_balance"] = peak
+        state.save()
+    rows = journal_rows(0, 1e12)[state.d.get("losses_ack", 0):]
+    reasons = G.check_account(G.settings(CFG), last_pnls=[r["pnl"] for r in rows], equity=acc.equity,
+                              peak_balance=peak)
+    if reasons:
+        state.d["hold"] = {"type": "account", "sid": 0, "reasons": reasons, "created": time.time()}
+        state.save()
+        await notify("🛡 ЗАЩИТА: торговля на паузе\n• " + "\n• ".join(reasons)
+                     + f"\nБаланс {acc.balance:.2f}, эквити {acc.equity:.2f}. Открытые сделки веду дальше "
+                       "(стопы/тейки на месте). Новые сигналы — только после вашего решения.",
+                     buttons=guard_buttons("account", 0),
+                     alt="Ответьте /resume — продолжить торговлю")
+
+
+async def resolve_hold(action, sid=""):
+    """Решение владельца по кнопке или команде. Возвращает короткий ответ для всплывашки."""
+    h = state.d.get("hold")
+    if not h:
+        return "Уже неактуально"
+    g = G.settings(CFG)
+    if h["type"] == "trade" and action in ("ok", "safe", "no"):
+        if sid and str(sid) != str(h["sid"]):
+            return "Это решение уже неактуально"
+        rec = state.signals.get(str(h["sid"]))
+        state.d["hold"] = None
+        if action == "no" or rec is None:
+            if rec:
+                rec["status"], rec["reason"] = "skipped", "отклонено вами (защита)"
+            state.save()
+            await notify(f"❌ Сигнал #{h['sid']} пропущен по вашему решению. Продолжаю работу.")
+            return "Пропущено"
+        if time.time() - h["created"] > g["approval_ttl_min"] * 60:
+            rec["status"], rec["reason"] = "skipped", "разрешение пришло поздно"
+            state.save()
+            await notify(f"⌛️ Прошло больше {g['approval_ttl_min']} мин — сигнал #{h['sid']} устарел, не открываю. "
+                         "Продолжаю работу.")
+            return "Устарело"
+        sig = parse_signal(rec["text"], **CFG.get("sanity", {}))
+        plan, text_plan = trader.prepare(int(h["sid"]), sig)
+        if plan and action == "safe":
+            limit = g["max_trade_risk_pct"] / 100 * trader.account().balance
+            if plan["risk"] > limit:
+                max_lot = plan["lot"] * limit / plan["risk"]
+                plan, text_plan = trader.prepare(int(h["sid"]), sig, max_lot=max_lot)
+                if plan is None:
+                    text_plan = (f"даже минимальный лот даёт риск больше {g['max_trade_risk_pct']:g}% "
+                                 f"баланса — не открываю")
+        head = f"✅ Сигнал #{h['sid']} — открываю по вашему решению"
+        if plan:
+            orders, rep = trader.execute(plan)
+        else:
+            orders, rep = [], text_plan
+        rec["status"] = "skipped"
+        await finish_open(rec, sig, orders, rep, head)
+        return "Выполняю"
+    if h["type"] == "account" and action in ("resume", "keep"):
+        if action == "keep":
+            state.d["paused"] = True
+        state.d["hold"] = None
+        state.d["losses_ack"] = len(journal_rows(0, 1e12))
+        state.d["peak_balance"] = trader.account().balance
+        state.save()
+        await notify("▶️ Продолжаю торговлю." if action == "resume" else
+                     "⏸ Оставил на паузе. Продолжить: /resume")
+        return "Принято"
+    if h["type"] == "sl" and action in ("slok", "slno"):
+        rec = state.signals.get(str(h["sid"]))
+        state.d["hold"] = None
+        state.save()
+        if action == "slok" and rec:
+            lines = trader.set_sl(rec, h["price"])
+            await notify(f"✅ Сигнал #{h['sid']}: стоп перенесён на {h['price']:g}\n" + "\n".join("• " + l for l in lines))
+        else:
+            await notify(f"Сигнал #{h['sid']}: стоп оставил прежним.")
+        return "Принято"
+    return "Не подходит к текущему вопросу"
 
 
 def resolve_target(msg):
@@ -239,7 +407,19 @@ async def handle_command(msg, text, cmds):
                 if res:
                     lines += res
             elif c.kind == "sl":
-                if _plausible(rec, c.price):
+                pos = trader.positions_of(rec)
+                worse = pos and any(G.sl_move_increases_risk(rec["side"], p.price_open, p.sl or rec["sl"], c.price)
+                                    for p in pos)
+                if _plausible(rec, c.price) and worse and G.settings(CFG).get("enabled", True):
+                    state.d["hold"] = {"type": "sl", "sid": rec["id"], "price": c.price, "created": time.time(),
+                                       "reasons": ["новый стоп дальше от входа — риск растёт"]}
+                    state.save()
+                    await notify(f"🛡 Канал просит перенести стоп сигнала #{rec['id']} на {c.price:g} — это ДАЛЬШЕ "
+                                 f"от входа, риск по сделке вырастет. Переносить?",
+                                 buttons=guard_buttons("sl", rec["id"]),
+                                 alt="Ответьте /slok — перенести, /slno — оставить")
+                    lines.append("жду вашего решения по переносу стопа")
+                elif _plausible(rec, c.price):
                     lines += trader.set_sl(rec, c.price) or ["нет открытых позиций"]
                 else:
                     lines.append(f"стоп {c.price:g} выглядит неправдоподобно — не меняю")
@@ -348,6 +528,7 @@ async def monitor():
 
 async def daily_checks():
     await scheduled_reports()
+    await guard_account_check()
     n = now_msk()
     today = n.strftime("%Y-%m-%d")
     acc = trader.account()
@@ -543,11 +724,22 @@ async def scheduled_reports():
 # ------------------------------------------------------------------ команды в «Избранном»
 
 HELP = ("Команды (пишите сюда):\n/status — счёт и открытые сделки\n/report — отчёт за день (/report week, /report month)\n/pause — не входить в новые сигналы\n"
-        "/resume — снова входить\n/closeall — закрыть ВСЕ сделки копировщика и снять лимитки\n/help — эта справка")
+        "/resume — снова входить\n/closeall — закрыть ВСЕ сделки копировщика и снять лимитки\n"
+        "/approve, /approve_safe, /reject — решение по сделке, остановленной защитой (если нет кнопок)\n/help — эта справка")
 
 
 async def handle_user_command(cmd, arg=""):
     cmd = cmd.lower()
+    alias = {"approve": "ok", "approve_safe": "safe", "reject": "no", "slok": "slok", "slno": "slno"}
+    if cmd in alias:
+        await notify(await resolve_hold(alias[cmd]))
+        return
+    if cmd == "resume" and state.d.get("hold"):
+        h = state.d["hold"]
+        if h["type"] == "account":
+            await resolve_hold("resume")
+        elif h["type"] == "trade":
+            await resolve_hold("no")
     if cmd == "report":
         kind = {"week": "week", "неделя": "week", "month": "month", "месяц": "month"}.get(arg.strip().lower(), "day")
         await notify(build_report(kind))
@@ -651,6 +843,26 @@ async def main():
             if OWNER_IDS and event.sender_id not in OWNER_IDS:
                 return
             await on_cmd(event)
+
+        @bot.on(events.CallbackQuery(pattern=rb"^g:"))
+        async def on_button(event):
+            if OWNER_IDS and event.sender_id not in OWNER_IDS:
+                await event.answer("Кнопки только для владельца", alert=True)
+                return
+            if trader is None:
+                await event.answer("Копировщик ещё запускается")
+                return
+            _, action, sid = event.data.decode().split(":", 2)
+            try:
+                ans = await resolve_hold(action, sid if sid != "0" else "")
+            except Exception as e:
+                log.exception("ошибка кнопки")
+                ans = f"Ошибка: {e}"
+            await event.answer(ans[:190])
+            try:
+                await event.edit(buttons=None)
+            except Exception:
+                pass
     else:
         try:
             notify_peer = await client.get_input_entity(NOTIFY)

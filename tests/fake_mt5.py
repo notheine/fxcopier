@@ -9,10 +9,11 @@ class FakeMT5:
     def initialize(s,**k): return True
     def reconnect_lib(s): pass
     def last_error(s): return (1,'ok')
-    def account_info(s): return NS(login=1,server='demo',trade_mode=0,balance=s.balance,equity=s.balance+sum(s._pl(p) for p in s.pos.values()),currency='USD',margin_mode=2)
+    def account_info(s): return NS(login=1,server='demo',trade_mode=0,balance=s.balance,equity=s.balance+sum(s._pl(p) for p in s.pos.values()),currency='USD',margin_mode=2,margin_free=s.balance)
     def terminal_info(s): return NS(connected=True,trade_allowed=True)
-    def symbol_info(s,n): return NS(digits=2,point=0.01,trade_stops_level=0,filling_mode=1,volume_min=0.01,volume_step=0.01) if n=='GOLD' else None
+    def symbol_info(s,n): return NS(digits=2,point=0.01,trade_stops_level=0,filling_mode=1,volume_min=0.01,volume_step=0.01,trade_tick_size=0.01,trade_tick_value=1.0,trade_contract_size=100.0) if n=='GOLD' else None
     def symbol_select(s,n,on=True): return True
+    def order_calc_margin(s,t,n,v,px): return v*100*px/100.0   # плечо 1:100
     def symbol_info_tick(s,n): return NS(bid=s.bid,ask=round(s.bid+s.spread,2))
     def _pl(s,p,px=None):
         if px is None: px = s.bid if p.type==0 else s.bid+s.spread

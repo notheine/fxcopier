@@ -22,6 +22,13 @@
 Нужна настройка Claude «Allow network egress → All domains». Файлы на Mac пиши через
 device_commit_files в **новое имя**, затем `mv` (запись поверх существующего файла может не обновить содержимое) и сверяй md5.
 
+## Push в GitHub
+
+- Если GitHub привязан к Claude — `add_repo notheine/fxcopier (push)` и обычный git из облачной среды.
+- Иначе через Mac: в репозитории добавлен deploy key с правом записи, приватная часть — `~/FxCopier/.ssh/gh_key`.
+  В device_bash: `GIT_SSH_COMMAND="ssh -i <копия gh_key с chmod 600>" git push git@github.com:notheine/fxcopier.git main`
+  (рабочая копия репозитория в домашней папке песочницы, не в `~/FxCopier`: туда нельзя удалять/перезаписывать через git).
+
 ## Правила работы
 
 1. **После каждого изменения кода — коммит и push в `main`** этого репозитория (без напоминаний владельца).

@@ -1,0 +1,6 @@
+telethon>=1.36
+pyyaml>=6
+rpyc==6.0.1
+tzdata
+MetaTrader5; platform_system == "Windows"
+qrcode>=7

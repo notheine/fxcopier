@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Управление копировщиком на сервере.
+#   fxctl setup       — ввести данные (счёт MT5 + Telegram) и запустить
+#   fxctl mt5         — только счёт MT5 (без Telegram) и запуск терминала
+#   fxctl tg          — вход в Telegram по QR-коду и запуск копировщика
+#   fxctl bot <user>  — создать бота и группу для отчётов (user — ваш основной username)
+#   fxctl test        — тестовые позиции по последнему сигналу (только демо)
+#   fxctl test-status — показать тестовые позиции
+#   fxctl test-close  — закрыть тестовые позиции
+#   fxctl start       — запустить всё
+#   fxctl stop        — остановить копировщик (MT5 продолжает работать)
+#   fxctl restart     — перезапустить всё
+#   fxctl status      — состояние служб
+#   fxctl logs        — журнал копировщика (выход: Ctrl+C)
+#   fxctl mode dry_run|demo|live — сменить режим и перезапустить
+#   fxctl vnc         — показать экран MT5 (через SSH-туннель)
+set -euo pipefail
+APP_USER=fx
+DST=/home/$APP_USER/copier
+PREFIX=/home/$APP_USER/.wine
+SERVICES="fx-xvfb fx-mt5 fx-bridge fx-copier"
+
+cfg_set() { sudo -u $APP_USER $DST/venv/bin/python - "$@" <<'PY'
+import sys, yaml
+path = "/home/fx/copier/config.yaml"
+cfg = yaml.safe_load(open(path, encoding="utf-8"))
+for kv in sys.argv[1:]:
+    raw = kv.find(":=") != -1 and kv.find(":=") == kv.find("=") - 1   # key:=value — значение как есть
+    key, val = kv.split(":=", 1) if raw else kv.split("=", 1)
+    node = cfg
+    *parents, last = key.split(".")
+    for p in parents:
+        node = node[p]
+    node[last] = val if raw else yaml.safe_load(val)
+yaml.safe_dump(cfg, open(path, "w", encoding="utf-8"), allow_unicode=True, sort_keys=False)
+PY
+}
+
+need_root() { [ "$(id -u)" = 0 ] || { echo "запускайте от root"; exit 1; }; }
+ensure_cfg() { [ -f $DST/config.yaml ] || sudo -u $APP_USER cp $DST/config.example.yaml $DST/config.yaml; }
+run_py() { cd $DST && sudo -u $APP_USER $DST/venv/bin/python "$@"; }
+bridge_up() { (echo > /dev/tcp/127.0.0.1/18812) 2>/dev/null; }
+
+setup_mt5() {
+  echo "== Счёт MT5 (сначала ДЕМО)"
+  read -rp "Логин (номер счёта): " LOGIN
+  read -rsp "Пароль от счёта (ввод не отображается): " PASS; echo
+  read -rp "Сервер [FxPro-MT5 Demo]: " SRV; SRV=${SRV:-FxPro-MT5 Demo}
+  cfg_set "mt5.login=$LOGIN" "mt5.password:=$PASS" "mt5.server:=$SRV" \
+          "mt5.terminal_path:=$(cat $DST/mt5_path.txt)" "mt5.portable=true"
+  mkdir -p $PREFIX/drive_c/fx
+  printf '[Common]\nLogin=%s\nPassword=%s\nServer=%s\nKeepPrivate=1\nNewsEnable=0\n[Experts]\nAllowLiveTrading=1\nAllowDllImport=0\nEnabled=1\nAccount=0\nProfile=0\n' \
+    "$LOGIN" "$PASS" "$SRV" > $PREFIX/drive_c/fx/start.ini
+  chown -R $APP_USER:$APP_USER $PREFIX/drive_c/fx
+  chmod 600 $PREFIX/drive_c/fx/start.ini $DST/config.yaml
+}
+
+setup_telegram() {
+  echo "== Telegram (данные с https://my.telegram.org → API development tools)"
+  read -rp "api_id: " API_ID
+  read -rp "api_hash: " API_HASH
+  read -rp "Часть названия канала [Win Win]: " CH; CH=${CH:-Win Win}
+  cfg_set "telegram.api_id=$API_ID" "telegram.api_hash:=$API_HASH" "telegram.channel:=$CH"
+  echo "== Вход в Telegram по QR-коду"
+  run_py tg_login.py
+}
+
+start_mt5() {
+  systemctl enable fx-xvfb fx-mt5 fx-bridge >/dev/null 2>&1
+  systemctl restart fx-xvfb fx-mt5 fx-bridge
+  echo -n "Жду запуска MT5 и моста"
+  for i in $(seq 1 45); do
+    if bridge_up; then echo " — готово"; sleep 15; return 0; fi
+    echo -n "."; sleep 2
+  done
+  echo; echo "Мост к MT5 не поднялся. Журнал:"
+  journalctl -u fx-bridge -u fx-mt5 -n 30 --no-pager
+  return 1
+}
+
+case "${1:-}" in
+setup)
+  need_root; ensure_cfg; setup_mt5; setup_telegram
+  echo; echo "Если ваш канал есть в списке выше — всё ок. Запускаю в тестовом режиме (dry_run)…"
+  start_mt5 || true
+  systemctl enable fx-copier >/dev/null 2>&1; systemctl restart fx-copier
+  echo "Готово. Через ~30 секунд в «Избранном» Telegram придёт сообщение «Копировщик запущен»." ;;
+tg)
+  need_root; ensure_cfg; setup_telegram
+  echo; echo "Запускаю копировщик в тестовом режиме (dry_run — без сделок)…"
+  systemctl enable fx-copier >/dev/null 2>&1; systemctl restart fx-copier
+  echo "Через ~30 секунд в «Избранном» Telegram придёт «🚀 Копировщик запущен»." ;;
+bot)
+  need_root
+  owner="${2:?укажите username владельца без @, например: fxctl bot notheine}"
+  systemctl stop fx-copier || true
+  run_py setup_bot.py "$owner"
+  systemctl start fx-copier ;;
+mt5)
+  need_root; ensure_cfg; setup_mt5; start_mt5
+  echo "Терминал MT5 запущен. Проверка сделкой:  fxctl test" ;;
+test)
+  bridge_up || start_mt5
+  run_py test_trade.py open ;;
+test-status) run_py test_trade.py status ;;
+test-close)  run_py test_trade.py close ;;
+start)   systemctl enable $SERVICES >/dev/null 2>&1; systemctl start $SERVICES ;;
+stop)    systemctl stop fx-copier ;;
+restart) systemctl restart $SERVICES ;;
+status)  systemctl --no-pager status $SERVICES | grep -E "●|Active:" ;;
+logs)    tail -n 100 -f $DST/logs/copier.log ;;
+mode)
+  m="${2:?укажите режим: dry_run | demo | live}"
+  if [ "$m" = live ]; then
+    read -rp "Реальные деньги! Напишите ДА для подтверждения: " a; [ "$a" = "ДА" ] || exit 1
+    cfg_set "mode=live" "i_understand_live_trading=true"
+  else
+    cfg_set "mode=$m" "i_understand_live_trading=false"
+  fi
+  systemctl restart fx-copier; echo "Режим: $m" ;;
+vnc)
+  echo "Экран MT5 открыт на localhost:5900 сервера. На Mac в новом окне Терминала выполните:"
+  echo "  ssh -L 5900:localhost:5900 root@<IP_сервера>"
+  echo "и затем Finder → Переход → Подключение к серверу → vnc://localhost:5900   (Ctrl+C здесь — закрыть)"
+  sudo -u $APP_USER x11vnc -display :99 -localhost -nopw -forever -quiet ;;
+*) sed -n '2,16p' "$0" ;;
+esac

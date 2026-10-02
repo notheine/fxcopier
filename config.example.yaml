@@ -1,0 +1,97 @@
+# Скопируйте этот файл в config.yaml и заполните.
+#
+# mode:
+#   dry_run — только читает канал и пишет вам, что БЫ сделал (ордера не отправляются)
+#   demo    — торгует, но ТОЛЬКО на демо-счёте (на реальном счёте откажется запускаться)
+#   live    — реальный счёт (нужно ещё i_understand_live_trading: true)
+mode: dry_run
+i_understand_live_trading: false
+
+timezone: Europe/Moscow
+
+telegram:
+  api_id: 1234567            # с my.telegram.org → API development tools
+  api_hash: "0123456789abcdef0123456789abcdef"
+  channel: "Win Win"         # часть названия канала или его числовой ID (см. list_chats.py)
+  notify_chat: me            # куда слать отчёты: me = «Избранное» или username (например notheine)
+  forward_signals: true      # пересылать оригинал каждого сигнала перед отчётом
+
+mt5:
+  login: 59000000            # номер счёта
+  password: ""               # пароль от торгового счёта (хранится только на сервере)
+  server: "FxPro-MT5 Demo"
+  terminal_path: ""          # путь к terminal64.exe; на Linux заполняет установщик
+  bridge_host: 127.0.0.1     # только для Linux (мост к MT5 под Wine)
+  bridge_port: 18812
+
+magic: 770077                # метка ордеров копировщика (свои ручные сделки он не трогает)
+
+# Лот по таблице куратора: [минимальный баланс $, общий лот на сигнал]
+# Общий лот делится поровну на 3 позиции (TP1, TP2, TP3).
+lot_table:
+  - [200, 0.01]
+  - [500, 0.02]
+  - [600, 0.03]
+  - [700, 0.04]
+  - [900, 0.05]
+  - [1500, 0.06]
+  - [2000, 0.08]
+  - [3000, 0.10]
+  - [4000, 0.12]
+  - [6000, 0.14]
+  - [7000, 0.16]
+  - [8000, 0.18]
+  - [9000, 0.20]
+  - [10000, 0.22]
+fixed_total_lot: null        # если указать число (например 0.03) — таблица игнорируется
+halve_on_risky: true         # сигналы с пометкой RISKY — лот вдвое меньше
+
+risk:
+  max_active_signals: 2          # «не более 2 сигналов одновременно»
+  max_daily_loss_pct: 10         # при просадке за день на 10% — новые входы до завтра не делаем
+  max_signal_age_sec: 120        # сигнал старше 2 минут (например, после сбоя) — не входим
+  late_entry_expiry_min: 20      # цена убежала от зоны → ставим лимитку на краю зоны на 20 мин
+  limit_signal_expiry_min: 240   # лимитные сигналы (LIMIT) ждут до 4 часов
+
+management:
+  auto_be_after_tp1: true        # цена дошла до TP1 → стоп в безубыток сам, не дожидаясь канала
+  follow_be: true                # выполнять «стоп в БУ» из канала
+  follow_close: true             # выполнять «закрываем по рынку»
+  follow_closed_reports: true    # канал пишет «сделка закрылась» — закрыть то, что осталось у нас
+
+weekend:
+  enabled: true
+  no_new_entries_after: "22:00"  # пятница, МСК
+  close_all_at: "23:30"          # пятница, МСК — закрыть всё (на выходные не оставляем)
+
+symbols:
+  GOLD:
+    enabled: true
+    candidates: [XAUUSD, GOLD, XAUUSD., XAUUSDm, XAUUSD.r]
+    entry_tolerance: 2.0     # можно входить до +2$ от края зоны (правило куратора)
+    max_spread: 0.8          # больше — не входим (новости)
+    max_slippage: 0.5        # допустимое проскальзывание при входе, $
+    be_offset: 0.3           # безубыток = вход + 0.3$ (чтобы покрыть спред/комиссию)
+    min_sl_gap: 1.0          # не входить, если до стопа меньше 1$
+  BTC:
+    enabled: false           # по BTC сигналов мало и таблица лотов к нему не подходит
+    candidates: [BTCUSD, BITCOIN]
+    entry_tolerance: 50
+    max_spread: 60
+    max_slippage: 30
+    be_offset: 20
+    min_sl_gap: 50
+
+# Проверки сигналов на опечатки
+sanity:
+  max_zone_pct: 0.75         # зона входа шире 0.75% цены — опечатка
+  max_tp_pct: 3.0            # тейк дальше 3% от входа — опечатка
+  max_sl_pct: 2.0            # стоп дальше 2% от входа — опечатка
+
+monitor_interval_sec: 0.5
+
+reports:
+  enabled: true
+  daily_at: "23:50"          # Пн–Пт, МСК
+  weekly_at: "23:52"         # пятница, МСК
+  monthly_at: "10:00"        # 1-е число — итоги прошлого месяца

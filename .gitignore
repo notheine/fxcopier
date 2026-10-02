@@ -1,0 +1,15 @@
+# секреты и данные — никогда в git
+config.yaml
+*.session
+*.session-journal
+state*.json
+journal.jsonl
+test_state.json
+mt5_path.txt
+logs/
+.ssh/
+_diag/
+venv/
+__pycache__/
+*.pyc
+.DS_Store

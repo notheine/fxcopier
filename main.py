@@ -1,0 +1,709 @@
+"""
+Копировщик сигналов: Telegram-канал → MetaTrader 5.
+
+Запуск:  python main.py
+Первый запуск спросит номер телефона и код из Telegram (вводится на сервере).
+"""
+import asyncio
+import datetime as dt
+import json
+import logging
+import os
+import sys
+import time
+from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
+
+import yaml
+from telethon import TelegramClient, events
+
+from parser import parse_signal, parse_command, looks_like_signal
+from mt5link import MT5Link
+from trader import Trader
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+os.chdir(BASE)
+CFG = yaml.safe_load(open("config.yaml", encoding="utf-8"))
+MSK = ZoneInfo(CFG.get("timezone", "Europe/Moscow"))
+MODE = CFG.get("mode", "dry_run")
+DRY = MODE == "dry_run"
+
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[RotatingFileHandler("logs/copier.log", maxBytes=5_000_000, backupCount=10, encoding="utf-8"),
+              logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("main")
+
+
+# ------------------------------------------------------------------ состояние
+
+class State:
+    def __init__(self, path="state.json"):
+        self.path = path
+        self.d = {"signals": {}, "msg2sig": {}, "paused": False, "day": "", "day_equity": 0.0,
+                  "day_paused": False, "weekend_done": ""}
+        if os.path.exists(path):
+            self.d.update(json.load(open(path, encoding="utf-8")))
+
+    def save(self):
+        tmp = self.path + ".tmp"
+        json.dump(self.d, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        os.replace(tmp, self.path)
+
+    @property
+    def signals(self):
+        return self.d["signals"]
+
+    def active(self):
+        return sorted((r for r in self.signals.values() if r["status"] == "active"),
+                      key=lambda r: r["created"], reverse=True)
+
+
+state = State()
+link = None
+trader = None
+client = TelegramClient(os.path.join(BASE, "session"), int(CFG["telegram"]["api_id"]),
+                        CFG["telegram"]["api_hash"], catch_up=True)
+NOTIFY = CFG["telegram"].get("notify_chat", "me")
+notify_peer = None   # сущность получателя отчётов (резолвится при старте)
+BOT_TOKEN = CFG["telegram"].get("bot_token")
+REPORT_CHAT = CFG["telegram"].get("report_chat")
+OWNER_IDS = set(CFG["telegram"].get("owner_ids", []))
+bot = TelegramClient(os.path.join(BASE, "bot_session"), int(CFG["telegram"]["api_id"]),
+                     CFG["telegram"]["api_hash"]) if BOT_TOKEN and REPORT_CHAT else None
+channel_entity = None
+mt5_ok = False
+
+
+async def notify(text: str):
+    log.info("NOTIFY: %s", text.replace("\n", " | "))
+    try:
+        if bot:
+            await bot.send_message(REPORT_CHAT, text[:4000])
+        else:
+            await client.send_message(notify_peer or NOTIFY, text[:4000])
+    except Exception as e:
+        log.error("не удалось отправить уведомление: %s", e)
+
+
+def now_msk():
+    return dt.datetime.now(MSK)
+
+
+def entries_blocked():
+    """Причина, по которой новые входы запрещены, или None."""
+    if state.d["paused"]:
+        return "копировщик на паузе (/resume чтобы продолжить)"
+    if state.d["day_paused"]:
+        return "достигнут дневной лимит убытка — новые входы до завтра остановлены"
+    if not mt5_ok:
+        return "нет связи с MT5"
+    wk = CFG.get("weekend", {})
+    n = now_msk()
+    if wk.get("enabled", True) and n.weekday() == 4:
+        hh, mm = map(int, wk.get("no_new_entries_after", "22:00").split(":"))
+        if (n.hour, n.minute) >= (hh, mm):
+            return "пятница вечер — новые сделки не открываю (на выходные не оставляем)"
+    if n.weekday() >= 5:
+        return "выходные, рынок закрыт"
+    mx = CFG["risk"].get("max_active_signals", 2)
+    if len(state.active()) >= mx:
+        return f"уже {mx} активных сигнала (лимит max_active_signals)"
+    return None
+
+
+# ------------------------------------------------------------------ сигналы
+
+async def forward_signal(msg):
+    """Пересылает оригинальный сигнал из канала получателю отчётов."""
+    if not CFG["telegram"].get("forward_signals", True):
+        return
+    if bot:
+        when = msg.date.astimezone(MSK).strftime("%H:%M:%S")
+        title = getattr(channel_entity, "title", "канал")
+        await notify(f"📨 Сигнал из канала «{title}» ({when} МСК):\n\n{(msg.message or '')[:3800]}")
+        return
+    try:
+        await client.forward_messages(notify_peer or NOTIFY, msg)
+    except Exception as e:
+        log.info("переслать не вышло (%s) — отправляю копией", e)
+        try:
+            await client.send_message(notify_peer or NOTIFY, "📨 Сигнал из канала:\n" + (msg.message or "")[:3900])
+        except Exception as e2:
+            log.error("не удалось отправить копию сигнала: %s", e2)
+
+
+async def handle_signal(msg, text, sig):
+    sid = str(msg.id)
+    rec = {"id": msg.id, "text": text, "created": time.time(), "symbol_key": sig.symbol, "side": sig.side,
+           "zone": list(sig.zone), "tps": {str(k): v for k, v in sig.tps.items()}, "sl": sig.sl,
+           "status": "skipped", "orders": [], "be_done": False, "limit_signal": sig.is_limit}
+    head = f"📩 Сигнал #{msg.id}: {sig.describe()}"
+
+    if not sig.valid:
+        rec["status"] = "invalid"
+        rec["reason"] = "ошибка в сигнале"
+        state.signals[sid] = rec
+        state.save()
+        await notify(head + "\n⛔️ НЕ ВХОЖУ — в сигнале ошибка:\n• " + "\n• ".join(sig.errors)
+                     + "\nЕсли канал исправит сообщение, я перепроверю.")
+        return
+    if sig.wait_confirm:
+        rec["status"] = "waiting"
+        rec["reason"] = "трейдер ещё не вошёл"
+        state.signals[sid] = rec
+        state.save()
+        await notify(head + "\n⏸ Трейдер пишет, что ещё не вошёл — жду отдельного сигнала/подтверждения.")
+        return
+    age = time.time() - msg.date.timestamp()
+    if age > CFG["risk"].get("max_signal_age_sec", 120) and not sig.is_limit:
+        rec["reason"] = "опоздание сигнала"
+        state.signals[sid] = rec
+        state.save()
+        await notify(head + f"\n⏭ Сигнал пришёл с опозданием {age:.0f} с — пропускаю.")
+        return
+    why = entries_blocked()
+    if why:
+        rec["reason"] = why.split(" —")[0].split(" (")[0]
+        state.signals[sid] = rec
+        state.save()
+        await notify(head + f"\n⏭ Пропускаю: {why}")
+        return
+
+    try:
+        orders, rep = trader.open_signal(msg.id, sig, dry_run=DRY)
+    except Exception as e:
+        log.exception("ошибка открытия")
+        orders, rep = [], f"⚠️ Ошибка: {e}"
+    if orders:
+        rec["status"] = "active"
+        rec["orders"] = orders
+        rec["symbol"] = trader.symbol(sig.symbol)
+        if any(o["kind"] == "limit" for o in orders):
+            rec["pending_since"] = time.time()
+            rec["pending_expiry_min"] = (CFG["risk"].get("limit_signal_expiry_min", 240) if sig.is_limit
+                                         else CFG["risk"].get("late_entry_expiry_min", 20))
+    else:
+        rec["reason"] = rep.replace("не вхожу: ", "").split(" — ")[0][:80]
+    state.signals[sid] = rec
+    state.save()
+    await notify(head + "\n" + ("✅ " if orders else "ℹ️ ") + rep)
+
+
+def resolve_target(msg):
+    """К какому сигналу относится команда."""
+    rid = msg.reply_to.reply_to_msg_id if msg.reply_to else None
+    if rid:
+        rid = str(rid)
+        if rid in state.signals:
+            return state.signals[rid], "ответ на сигнал"
+        if rid in state.d["msg2sig"] and state.d["msg2sig"][rid] in state.signals:
+            return state.signals[state.d["msg2sig"][rid]], "ответ в ветке сигнала"
+    act = state.active()
+    if not act:
+        return None, "нет активных сигналов"
+    note = "последний активный сигнал" + (f" (активных {len(act)}!)" if len(act) > 1 else "")
+    return act[0], note
+
+
+async def handle_command(msg, text, cmds):
+    rec, how = resolve_target(msg)
+    if rec is None:
+        if any(c.kind == "unknown" for c in cmds):
+            return
+        log.info("команда без активных сигналов: %s", text[:100])
+        return
+    state.d["msg2sig"][str(msg.id)] = str(rec["id"])
+    if rec["status"] != "active":
+        return
+    lines = []
+    for c in cmds:
+        try:
+            if DRY:
+                lines.append(f"[тест] {c.describe()}")
+                continue
+            if c.kind == "be":
+                if CFG["management"].get("follow_be", True):
+                    res = trader.move_to_be(rec)
+                    rec["be_done"] = True
+                    lines += res or ["стоп уже в безубытке"]
+            elif c.kind in ("close", "closed_report"):
+                if c.kind == "close" and not CFG["management"].get("follow_close", True):
+                    continue
+                if c.kind == "closed_report" and not CFG["management"].get("follow_closed_reports", True):
+                    continue
+                res = trader.close_all(rec)
+                if res:
+                    lines += res
+            elif c.kind == "sl":
+                if _plausible(rec, c.price):
+                    lines += trader.set_sl(rec, c.price) or ["нет открытых позиций"]
+                else:
+                    lines.append(f"стоп {c.price:g} выглядит неправдоподобно — не меняю")
+            elif c.kind == "tp":
+                if _plausible(rec, c.price):
+                    lines += trader.set_tp(rec, c.tp_index, c.price)
+                else:
+                    lines.append(f"тейк {c.price:g} выглядит неправдоподобно — не меняю")
+            elif c.kind == "cancel":
+                lines += trader.cancel_pending(rec) or ["лимиток нет"]
+            elif c.kind == "unknown":
+                lines.append("❓ не понял, что делать — проверьте сами, при необходимости действуйте вручную "
+                             "или командой /closeall")
+        except Exception as e:
+            log.exception("ошибка команды")
+            lines.append(f"⚠️ ошибка: {e}")
+    state.save()
+    noop = ("стоп уже в безубытке", "нет открытых позиций", "лимиток нет")
+    lines = [l for l in lines if l not in noop]
+    if lines:
+        await notify(f"📣 Канал: «{text.strip()[:300]}»\n→ сигнал #{rec['id']} ({how}): "
+                     + ", ".join(c.describe() for c in cmds) + "\n" + "\n".join("• " + l for l in lines))
+
+
+def _plausible(rec, price):
+    ref = rec["zone"][0]
+    return abs(price - ref) / ref < 0.03
+
+
+async def handle_edit(msg):
+    sid = str(msg.id)
+    text = msg.message or ""
+    rec = state.signals.get(sid)
+    sig = parse_signal(text, **CFG.get("sanity", {}))
+    if rec is None:
+        # сообщение стало сигналом после правки
+        if sig and time.time() - msg.date.timestamp() < CFG["risk"].get("max_signal_age_sec", 120):
+            await handle_signal(msg, text, sig)
+        return
+    if not sig:
+        return
+    old = parse_signal(rec["text"], **CFG.get("sanity", {}))
+    if old and old.describe() == sig.describe() and old.errors == sig.errors:
+        return
+    rec["text"] = text
+    head = f"✏️ Канал исправил сигнал #{msg.id}: {sig.describe()}"
+    if rec["status"] in ("invalid", "waiting", "skipped") and not rec["orders"]:
+        state.signals.pop(sid)
+        if sig.valid and not sig.wait_confirm:
+            await notify(head + "\nПерепроверяю и обрабатываю заново.")
+        await handle_signal(msg, text, sig)
+        return
+    if rec["status"] == "active" and sig.valid and not DRY:
+        lines = []
+        if sig.sl != rec["sl"]:
+            lines += trader.set_sl(rec, sig.sl)
+        for k, v in sig.tps.items():
+            if rec["tps"].get(str(k)) != v:
+                lines += trader.set_tp(rec, k, v)
+        rec["sl"] = sig.sl
+        rec["tps"] = {str(k): v for k, v in sig.tps.items()}
+        state.save()
+        await notify(head + ("\n" + "\n".join("• " + l for l in lines) if lines else ""))
+    elif not sig.valid:
+        await notify(head + "\n⚠️ После правки в сигнале ошибка: " + "; ".join(sig.errors) + " — ничего не меняю")
+
+
+# ------------------------------------------------------------------ фоновый контроль
+
+async def monitor():
+    global mt5_ok
+    last_reconnect = 0
+    alerted = False
+    while True:
+        await asyncio.sleep(CFG.get("monitor_interval_sec", 0.5))
+        try:
+            if not trader.healthy():
+                raise ConnectionError("terminal not connected")
+            if not mt5_ok:
+                mt5_ok = True
+                if alerted:
+                    await notify("✅ Связь с MT5 восстановлена.")
+                alerted = False
+        except Exception as e:
+            mt5_ok = False
+            if not alerted:
+                alerted = True
+                await notify(f"🚨 Нет связи с MT5 ({e}). Новые сигналы и перенос в безубыток не работают! "
+                             "Стопы и тейки на сервере брокера продолжают действовать. Пытаюсь переподключиться…")
+            if time.time() - last_reconnect > 15:
+                last_reconnect = time.time()
+                try:
+                    link.reconnect_lib()
+                    trader.connect()
+                except Exception as e2:
+                    log.warning("переподключение не удалось: %s", e2)
+            continue
+
+        try:
+            await daily_checks()
+            for rec in list(state.active()):
+                await check_signal(rec)
+        except Exception:
+            log.exception("ошибка в мониторе")
+
+
+async def daily_checks():
+    await scheduled_reports()
+    n = now_msk()
+    today = n.strftime("%Y-%m-%d")
+    acc = trader.account()
+    if state.d["day"] != today:
+        state.d.update(day=today, day_equity=acc.equity, day_paused=False)
+        state.save()
+    lim = CFG["risk"].get("max_daily_loss_pct", 10)
+    base = state.d["day_equity"] or acc.equity
+    if not state.d["day_paused"] and acc.equity <= base * (1 - lim / 100):
+        state.d["day_paused"] = True
+        state.save()
+        await notify(f"🛑 Дневной лимит убытка {lim}% достигнут (эквити {acc.equity:.2f} при старте дня {base:.2f}). "
+                     "Новые сигналы пропускаю до завтра. Открытые сделки веду дальше.")
+    wk = CFG.get("weekend", {})
+    if wk.get("enabled", True) and n.weekday() == 4:
+        hh, mm = map(int, wk.get("close_all_at", "23:30").split(":"))
+        if (n.hour, n.minute) >= (hh, mm) and state.d["weekend_done"] != today:
+            state.d["weekend_done"] = today
+            lines = []
+            for rec in state.active():
+                if not DRY:
+                    lines += trader.close_all(rec)
+            state.save()
+            if lines:
+                await notify("📅 Пятница: закрываю всё перед выходными\n" + "\n".join("• " + l for l in lines))
+
+
+async def check_signal(rec):
+    pos = trader.positions_of(rec)
+    pend = trader.pending_of(rec)
+    if not pos and not pend:
+        rec["status"] = "closed"
+        filled = any(o["kind"] == "market" for o in rec["orders"]) or rec.get("filled")
+        pnl, n = deal_stats(rec)
+        rec["pnl"], rec["closed"] = pnl, time.time()
+        state.save()
+        if filled or n:
+            journal_add(rec, pnl)
+            cur = trader.account().currency
+            await notify(f"🏁 Сигнал #{rec['id']} — все позиции закрыты. Итог: {pnl:+.2f} {cur}")
+        return
+    if pos and not rec.get("filled"):
+        rec["filled"] = True
+        state.save()
+        if any(o["kind"] == "limit" for o in rec["orders"]):
+            await notify(f"🎯 Сигнал #{rec['id']}: лимитный ордер исполнился — мы в позиции "
+                         f"({len(pos)} шт. @ {pos[0].price_open:g})")
+    bid, ask = trader.price(rec["symbol"])
+    tp1 = min(rec["tps"].items(), key=lambda kv: int(kv[0]))[1]
+    buy = rec["side"] == "BUY"
+    reached = (bid >= tp1) if buy else (ask <= tp1)
+
+    if pos and not rec["be_done"] and reached and CFG["management"].get("auto_be_after_tp1", True):
+        rec["be_done"] = True
+        res = trader.move_to_be(rec)
+        state.save()
+        if res:
+            await notify(f"🔒 Сигнал #{rec['id']}: цена дошла до TP1 {tp1:g} → стоп в безубыток\n"
+                         + "\n".join("• " + l for l in res))
+
+    if pend and not pos:
+        exp = rec.get("pending_expiry_min", 20) * 60
+        why = None
+        if reached:
+            why = f"цена дошла до TP1 {tp1:g} без нас"
+        elif time.time() - rec.get("pending_since", rec["created"]) > exp:
+            why = f"лимитка не исполнилась за {exp // 60:.0f} мин"
+        if why:
+            res = trader.cancel_pending(rec)
+            rec["status"] = "closed"
+            state.save()
+            await notify(f"⌛️ Сигнал #{rec['id']}: {why} — снимаю ордера\n" + "\n".join("• " + l for l in res))
+
+
+def deal_stats(rec):
+    """Итог по сигналу из истории сделок MT5: (прибыль с комиссиями, число сделок)."""
+    try:
+        ids = {o["ticket"] for o in rec["orders"]}
+        deals = trader.mt5.history_deals_get(rec["created"] - 86400, time.time() + 86400)
+        mine = [d for d in deals if int(d.position_id) in ids]
+        return round(sum(d.profit + d.commission + d.swap for d in mine), 2), len(mine)
+    except Exception as e:
+        log.warning("не удалось посчитать итог: %s", e)
+        return 0.0, 0
+
+
+# ------------------------------------------------------------------ журнал и отчёты
+
+JOURNAL = "journal.jsonl"
+
+
+def journal_add(rec, pnl):
+    row = {"id": rec["id"], "opened": rec["created"], "closed": time.time(), "pnl": pnl,
+           "side": rec["side"], "symbol": rec.get("symbol"), "be": rec.get("be_done", False)}
+    with open(JOURNAL, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def journal_rows(t0, t1):
+    rows = []
+    if os.path.exists(JOURNAL):
+        for line in open(JOURNAL, encoding="utf-8"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if t0 <= r["closed"] < t1:
+                rows.append(r)
+    return rows
+
+
+def period_bounds(kind, n=None):
+    """Начало и конец периода (timestamp) в МСК: day/week/month; prev_month — прошлый месяц."""
+    n = n or now_msk()
+    d0 = n.replace(hour=0, minute=0, second=0, microsecond=0)
+    if kind == "day":
+        start = d0
+    elif kind == "week":
+        start = d0 - dt.timedelta(days=d0.weekday())
+    elif kind == "month":
+        start = d0.replace(day=1)
+    elif kind == "prev_month":
+        end = d0.replace(day=1)
+        start = (end - dt.timedelta(days=1)).replace(day=1)
+        return start.timestamp(), end.timestamp(), start
+    return start.timestamp(), n.timestamp(), start
+
+
+def build_report(kind):
+    t0, t1, start = period_bounds(kind)
+    names = {"day": f"📊 Итоги дня {start:%d.%m}", "week": f"📊 Итоги недели с {start:%d.%m}",
+             "month": f"📊 Итоги месяца {start:%m.%Y}", "prev_month": f"📊 Итоги месяца {start:%m.%Y}"}
+    sigs = [r for r in state.signals.values() if t0 <= r["created"] < t1]
+    entered = [r for r in sigs if r["orders"]]
+    skipped = [r for r in sigs if not r["orders"]]
+    reasons = {}
+    for r in skipped:
+        k = r.get("reason") or r["status"]
+        reasons[k] = reasons.get(k, 0) + 1
+    rows = journal_rows(t0, t1)
+    pnl = sum(r["pnl"] for r in rows)
+    wins = [r for r in rows if r["pnl"] > 0.5]
+    losses = [r for r in rows if r["pnl"] < -0.5]
+    flat = len(rows) - len(wins) - len(losses)
+    acc = trader.account() if trader else None
+    cur = acc.currency if acc else ""
+    lines = [names[kind], ""]
+    lines.append(f"Сигналов: {len(sigs)} | вошёл: {len(entered)} | пропустил: {len(skipped)}")
+    for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:6]:
+        lines.append(f"   • {k}: {v}")
+    lines.append(f"Закрыто сделок: {len(rows)} | в плюс: {len(wins)} | в минус: {len(losses)} | в ноль: {flat}")
+    if rows:
+        wr = len(wins) / max(1, len(wins) + len(losses)) * 100
+        lines.append(f"Результат: {pnl:+.2f} {cur} | винрейт {wr:.0f}% (без нулевых)")
+        best = max(rows, key=lambda r: r["pnl"])
+        worst = min(rows, key=lambda r: r["pnl"])
+        lines.append(f"Лучшая: #{best['id']} {best['pnl']:+.2f} | худшая: #{worst['id']} {worst['pnl']:+.2f}")
+    if acc:
+        base = acc.balance - pnl
+        pct = f" ({pnl / base * 100:+.1f}% к началу периода)" if base > 0 and rows else ""
+        lines.append(f"Баланс: {acc.balance:.2f} {cur}{pct} | эквити {acc.equity:.2f}")
+        pos, orders = trader.all_own()
+        if pos or orders:
+            lines.append(f"Открыто сейчас: позиций {len(pos)}, лимиток {len(orders)}, "
+                         f"плавающий P/L {sum(p.profit for p in pos):+.2f}")
+    return "\n".join(lines)
+
+
+async def scheduled_reports():
+    n = now_msk()
+    hm = (n.hour, n.minute)
+    today = n.strftime("%Y-%m-%d")
+    sch = CFG.get("reports", {})
+    if not sch.get("enabled", True):
+        return
+    if n.weekday() < 5 and hm >= tuple(map(int, sch.get("daily_at", "23:50").split(":"))) \
+            and state.d.get("rep_day") != today:
+        state.d["rep_day"] = today
+        state.save()
+        await notify(build_report("day"))
+    if n.weekday() == 4 and hm >= tuple(map(int, sch.get("weekly_at", "23:52").split(":"))) \
+            and state.d.get("rep_week") != today:
+        state.d["rep_week"] = today
+        state.save()
+        await notify(build_report("week"))
+    if n.day == 1 and hm >= tuple(map(int, sch.get("monthly_at", "10:00").split(":"))) \
+            and state.d.get("rep_month") != today:
+        state.d["rep_month"] = today
+        state.save()
+        await notify(build_report("prev_month"))
+
+
+# ------------------------------------------------------------------ команды в «Избранном»
+
+HELP = ("Команды (пишите сюда):\n/status — счёт и открытые сделки\n/report — отчёт за день (/report week, /report month)\n/pause — не входить в новые сигналы\n"
+        "/resume — снова входить\n/closeall — закрыть ВСЕ сделки копировщика и снять лимитки\n/help — эта справка")
+
+
+async def handle_user_command(cmd, arg=""):
+    cmd = cmd.lower()
+    if cmd == "report":
+        kind = {"week": "week", "неделя": "week", "month": "month", "месяц": "month"}.get(arg.strip().lower(), "day")
+        await notify(build_report(kind))
+        return
+    if cmd == "status":
+        acc = trader.account()
+        pos, orders = trader.all_own()
+        lines = [f"Режим: {MODE} | счёт {acc.login} ({'демо' if acc.trade_mode == link.ACCOUNT_TRADE_MODE_DEMO else 'РЕАЛЬНЫЙ'})",
+                 f"Баланс {acc.balance:.2f}, эквити {acc.equity:.2f} {acc.currency}",
+                 f"Пауза: {'да' if state.d['paused'] else 'нет'}; дневной стоп: {'да' if state.d['day_paused'] else 'нет'}",
+                 f"MT5: {'на связи' if mt5_ok else 'НЕТ СВЯЗИ'}"]
+        for p in pos:
+            lines.append(f"• {p.symbol} {'BUY' if p.type == 0 else 'SELL'} {p.volume:g} @ {p.price_open:g} "
+                         f"SL {p.sl:g} TP {p.tp:g} → {p.profit:+.2f}")
+        for o in orders:
+            lines.append(f"• лимитка {o.symbol} {o.volume_current:g} @ {o.price_open:g}")
+        if not pos and not orders:
+            lines.append("Открытых сделок нет.")
+        await notify("\n".join(lines))
+    elif cmd == "pause":
+        state.d["paused"] = True
+        state.save()
+        await notify("⏸ Пауза: новые сигналы пропускаю. Открытые сделки веду дальше. /resume — продолжить.")
+    elif cmd == "resume":
+        state.d["paused"] = False
+        state.d["day_paused"] = False
+        state.save()
+        await notify("▶️ Продолжаю входить в сигналы.")
+    elif cmd == "closeall":
+        lines = []
+        for rec in state.active():
+            lines += trader.close_all(rec)
+            rec["status"] = "closed"
+        pos, orders = trader.all_own()
+        for p in pos:
+            ok, _, err = trader.close_position(p)
+            lines.append(f"#{p.ticket} {'закрыта' if ok else 'ошибка ' + err}")
+        for o in orders:
+            ok, _, err = trader.cancel_order(o)
+            lines.append(f"лимитка #{o.ticket} {'снята' if ok else 'ошибка ' + err}")
+        state.save()
+        await notify("🧹 Закрыл всё:\n" + ("\n".join("• " + l for l in lines) if lines else "нечего закрывать"))
+    else:
+        await notify(HELP)
+
+
+# ------------------------------------------------------------------ запуск
+
+async def find_channel():
+    """Ищет канал. Сначала по запомненному ID, затем по названию. None — если доступа ещё нет."""
+    want = str(CFG["telegram"]["channel"]).strip()
+    pinned = state.d.get("channel_id")
+    async for d in client.iter_dialogs():
+        if not d.is_channel:
+            continue
+        if pinned and d.id == pinned:
+            return d.entity
+        if not pinned and ((want.lstrip("-").isdigit() and str(d.id) == want) or want.lower() in (d.name or "").lower()):
+            state.d["channel_id"] = d.id
+            state.save()
+            return d.entity
+    return None
+
+
+async def wait_for_channel():
+    """Ждёт, пока заявку в канал одобрят (проверка раз в минуту)."""
+    ch = await find_channel()
+    if ch:
+        return ch
+    want = CFG["telegram"]["channel"]
+    await notify(f"⏳ Канал «{want}» пока недоступен — жду одобрения заявки. Проверяю раз в минуту, "
+                 "напишу, как только доступ появится.")
+    while True:
+        await asyncio.sleep(60)
+        try:
+            ch = await find_channel()
+        except Exception as e:
+            log.warning("ошибка поиска канала: %s", e)
+            continue
+        if ch:
+            await notify(f"✅ Доступ к каналу «{ch.title}» получен! Начинаю следить за сигналами.")
+            return ch
+
+
+async def main():
+    global link, trader, channel_entity, mt5_ok
+    global notify_peer
+    await client.start()
+
+    async def on_cmd(event):
+        if trader is None:
+            await notify("Копировщик ещё ждёт доступа к каналу. Команды заработают после этого.")
+            return
+        await handle_user_command(event.pattern_match.group(1), event.raw_text.split(maxsplit=1)[1] if len(event.raw_text.split()) > 1 else "")
+
+    if bot:
+        await bot.start(bot_token=BOT_TOKEN)
+
+        @bot.on(events.NewMessage(chats=REPORT_CHAT, pattern=r"^/(\w+)"))
+        async def on_bot_cmd(event):
+            if OWNER_IDS and event.sender_id not in OWNER_IDS:
+                return
+            await on_cmd(event)
+    else:
+        try:
+            notify_peer = await client.get_input_entity(NOTIFY)
+        except Exception as e:
+            log.error("получатель отчётов %s не найден (%s) — шлю в «Избранное»", NOTIFY, e)
+            notify_peer = "me"
+        cmd_chats = ["me"] if notify_peer == "me" else ["me", notify_peer]
+        client.add_event_handler(on_cmd, events.NewMessage(chats=cmd_chats, pattern=r"^/(\w+)"))
+
+    channel_entity = await wait_for_channel()
+    log.info("канал: %s (%s)", getattr(channel_entity, "title", "?"), channel_entity.id)
+
+    link = MT5Link(CFG["mt5"].get("bridge_host", "127.0.0.1"), int(CFG["mt5"].get("bridge_port", 18812)))
+    trader = Trader(CFG, link)
+    acc, is_demo = trader.connect()
+    mt5_ok = True
+    warn = "" if trader.trade_allowed() else "\n⚠️ В терминале выключена алготорговля (Algo Trading) — ордера не пройдут!"
+    await notify(f"🚀 Копировщик запущен. Режим: {MODE}{' (только разбор, без ордеров)' if DRY else ''}\n"
+                 f"Канал: {channel_entity.title}\nСчёт {acc.login} ({'демо' if is_demo else 'РЕАЛЬНЫЙ'}), "
+                 f"баланс {acc.balance:.2f} {acc.currency}{warn}\n/help — команды")
+
+    @client.on(events.NewMessage(chats=channel_entity))
+    async def on_new(event):
+        msg = event.message
+        text = msg.message or ""
+        log.info("канал #%s: %s", msg.id, text.replace("\n", " | ")[:300])
+        try:
+            sig = parse_signal(text, **CFG.get("sanity", {}))
+            if sig:
+                await forward_signal(msg)
+                await handle_signal(msg, text, sig)
+                return
+            cmds = parse_command(text)
+            if cmds:
+                await handle_command(msg, text, cmds)
+            elif looks_like_signal(text):
+                await notify(f"❓ Похоже на сигнал, но разобрать не смог:\n{text[:500]}")
+        except Exception as e:
+            log.exception("ошибка обработки")
+            await notify(f"⚠️ Ошибка при обработке сообщения #{msg.id}: {e}")
+
+    @client.on(events.MessageEdited(chats=channel_entity))
+    async def on_edit(event):
+        try:
+            await handle_edit(event.message)
+        except Exception as e:
+            log.exception("ошибка правки")
+            await notify(f"⚠️ Ошибка при обработке правки #{event.message.id}: {e}")
+
+    asyncio.create_task(monitor())
+    await client.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    with client:
+        client.loop.run_until_complete(main())

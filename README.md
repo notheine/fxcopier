@@ -31,7 +31,7 @@ ssh root@<IP> fxctl mode demo        # торговля на демо
 ```
 
 Команды в группе: `/status` `/entry` `/report` `/report week` `/report month` `/pause` `/resume` `/closeall` `/help`
-(`/entry 50` — точка входа в диапазоне сигнала: 0 — лучший край, 100 — худший)
+(`/entry 50`, `/entry buy 20`, `/entry sell 80` — точка входа в диапазоне сигнала: 0 — лучший край, 100 — худший)
 
 ## Безопасность
 

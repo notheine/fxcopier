@@ -66,32 +66,22 @@ class State:
 state = State()
 
 
-def entry_level():
-    """Точка входа в диапазоне сигнала: 0 — лучший край, 1 — худший. Владелец меняет командой /entry."""
-    lvl = state.d.get("entry_level")
+def entry_level(side="BUY"):
+    """Точка входа в диапазоне сигнала для BUY/SELL: 0 — лучший край, 1 — худший. Меняется командой /entry."""
+    rk = CFG.setdefault("risk", {})
+    key = f"entry_level_{side.lower()}"
+    lvl = state.d.get(key, state.d.get("entry_level"))
     if lvl is None:
-        lvl = CFG.setdefault("risk", {}).get("entry_level", 0.5)
-    CFG.setdefault("risk", {})["entry_level"] = float(lvl)
+        lvl = rk.get(key, rk.get("entry_level", 0.5))
+    rk[key] = float(lvl)
     return float(lvl)
 
 
 def entry_level_text():
-    return (f"Точка входа: {entry_level() * 100:.0f}% диапазона сигнала "
+    b, s_ = entry_level("BUY"), entry_level("SELL")
+    return (f"Точка входа в диапазоне сигнала: покупки {b * 100:.0f}%, продажи {s_ * 100:.0f}% "
             "(0% — лучший край: у BUY нижний, у SELL верхний; 100% — худший). "
-            "Цена хуже — ставлю BUY/SELL LIMIT на эту точку. Изменить: /entry 30")
-link = None
-trader = None
-client = TelegramClient(os.path.join(BASE, "session"), int(CFG["telegram"]["api_id"]),
-                        CFG["telegram"]["api_hash"], catch_up=True)
-NOTIFY = CFG["telegram"].get("notify_chat", "me")
-notify_peer = None   # сущность получателя отчётов (резолвится при старте)
-BOT_TOKEN = CFG["telegram"].get("bot_token")
-REPORT_CHAT = CFG["telegram"].get("report_chat")
-OWNER_IDS = set(CFG["telegram"].get("owner_ids", []))
-bot = TelegramClient(os.path.join(BASE, "bot_session"), int(CFG["telegram"]["api_id"]),
-                     CFG["telegram"]["api_hash"]) if BOT_TOKEN and REPORT_CHAT else None
-channel_entity = None
-mt5_ok = False
+            "Цена хуже точки — ставлю BUY/SELL LIMIT на неё. Изменить: /entry buy 20, /entry sell 80, /entry 50 (обе)")
 
 
 async def notify(text: str, buttons=None, alt=""):
@@ -197,6 +187,7 @@ async def handle_signal(msg, text, sig):
         await notify(head + f"\n⏭ Пропускаю: {why}")
         return
 
+    entry_level(sig.side)          # настройка владельца (/entry) → CFG для trader.prepare
     try:
         plan, text_plan = trader.prepare(msg.id, sig)
     except Exception as e:
@@ -764,7 +755,7 @@ async def scheduled_reports():
 # ------------------------------------------------------------------ команды в «Избранном»
 
 HELP = ("Команды (пишите сюда):\n/status — счёт и открытые сделки\n"
-        "/entry — точка входа в диапазоне сигнала (/entry 50 — середина, /entry 0 — лучший край)\n/report — отчёт за день (/report week, /report month)\n/pause — не входить в новые сигналы\n"
+        "/entry — точка входа в диапазоне сигнала (/entry buy 20, /entry sell 80, /entry 50 — обе)\n/report — отчёт за день (/report week, /report month)\n/pause — не входить в новые сигналы\n"
         "/resume — снова входить\n/closeall — закрыть ВСЕ сделки копировщика и снять лимитки\n"
         "/approve, /approve_safe, /reject — решение по сделке, остановленной защитой (если нет кнопок)\n/help — эта справка")
 
@@ -786,19 +777,24 @@ async def handle_user_command(cmd, arg=""):
         await notify(build_report(kind))
         return
     if cmd == "entry":
-        a = arg.strip().replace("%", "").replace(",", ".")
-        if a:
+        parts = arg.lower().replace("%", " ").replace(",", ".").split()
+        sides = ["BUY", "SELL"]
+        if parts and parts[0] in ("buy", "sell", "покупка", "покупки", "продажа", "продажи"):
+            sides = ["BUY"] if parts[0].startswith(("buy", "покуп")) else ["SELL"]
+            parts = parts[1:]
+        if parts:
             try:
-                v = float(a)
+                v = float(parts[0])
                 v = v / 100 if v > 1 else v
                 if not 0 <= v <= 1:
                     raise ValueError
             except ValueError:
-                await notify("Укажите число от 0 до 100, например /entry 50")
+                await notify("Укажите число от 0 до 100, например /entry buy 20 или /entry 50")
                 return
-            state.d["entry_level"] = v
+            state.d.pop("entry_level", None)
+            for sd in sides:
+                state.d[f"entry_level_{sd.lower()}"] = v
             state.save()
-            entry_level()
             await notify("✅ Сохранено. " + entry_level_text())
         else:
             await notify(entry_level_text())

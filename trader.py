@@ -212,7 +212,8 @@ class Trader:
         min_gap = max(stops_gap, spread * 2, sc.get("min_sl_gap", 0))
         rk = self.cfg.get("risk", {})
         action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap,
-                                          level=float(rk.get("entry_level", 0.5)),
+                                          level=float(rk.get(f"entry_level_{sig.side.lower()}",
+                                                             rk.get("entry_level", 0.5))),
                                           stop_orders=bool(rk.get("out_of_range_stop", False)))
         if action == "skip":
             return None, f"не вхожу: {why}"

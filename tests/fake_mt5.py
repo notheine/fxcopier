@@ -26,7 +26,12 @@ class FakeMT5:
     def order_send(s,r):
         s.reqs+=1; a=r['action']; t=next(s.ids); ok=lambda **k: NS(retcode=10009,order=k.get('order',0),price=k.get('price',0),comment='')
         if a==1 and 'position' in r:
-            s._close(s.pos[r['position']],why='market'); return ok(order=t,price=r['price'])
+            p=s.pos[r['position']]
+            if r.get('volume') and r['volume'] < p.volume - 1e-9:      # частичное закрытие
+                part=NS(**{**vars(p),'volume':r['volume']}); pl=s._pl(part); s.balance+=pl; p.volume=round(p.volume-r['volume'],8)
+                s.deals.append(NS(position_id=p.identifier,profit=pl,commission=0.0,swap=0.0,why='market'))
+                return ok(order=t,price=r['price'])
+            s._close(p,why='market'); return ok(order=t,price=r['price'])
         if a==1:
             # validate stops like a broker
             px=r['price']; buy=r['type']==0

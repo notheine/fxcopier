@@ -193,6 +193,9 @@ class Trader:
         stops_gap = max(int(info.trade_stops_level), 0) * info.point
         min_gap = max(stops_gap, spread * 2, sc.get("min_sl_gap", 0))
         action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap)
+        if action == "limit" and not sig.is_limit and not self.cfg.get("risk", {}).get("late_entry_limit", False):
+            # правило куратора: входить только на точке входа (допуск $2); цена ушла — сделку пропускаем
+            action, why = "skip", f"цена ушла от зоны входа больше чем на {sc.get('entry_tolerance', 0):g}$"
         if action == "skip":
             return None, f"не вхожу: {why}"
 
@@ -218,7 +221,7 @@ class Trader:
                 + (" (уменьшен защитой по вашему решению)" if max_lot is not None else ""))
         plan = {"sid": sid, "sig": sig, "name": name, "info": info, "sc": sc, "action": action, "price": price,
                 "positions": positions, "lot": lot, "table_lot": table_lot, "sl_distance": sl_dist,
-                "risk": risk, "margin": margin, "head": head}
+                "risk": risk, "margin": margin, "head": head, "reduced": bool(reduced)}
         return plan, head
 
     def execute(self, plan):
@@ -321,12 +324,13 @@ class Trader:
             return None
 
     # ---- действия по позициям
-    def close_position(self, p):
+    def close_position(self, p, volume=None):
+        """Закрыть позицию целиком или частично (volume)."""
         info = self.mt5.symbol_info(p.symbol)
         t = self.mt5.symbol_info_tick(p.symbol)
         is_buy = p.type == self.mt5.POSITION_TYPE_BUY
         req = {
-            "action": self.mt5.TRADE_ACTION_DEAL, "symbol": p.symbol, "volume": float(p.volume),
+            "action": self.mt5.TRADE_ACTION_DEAL, "symbol": p.symbol, "volume": float(volume or p.volume),
             "type": self.mt5.ORDER_TYPE_SELL if is_buy else self.mt5.ORDER_TYPE_BUY,
             "position": int(p.ticket), "price": t.bid if is_buy else t.ask,
             "deviation": int(round(1.0 / info.point)), "magic": self.magic,
@@ -361,6 +365,49 @@ class Trader:
         for p in self.positions_of(rec):
             ok, _, err = self.close_position(p)
             msgs.append(f"позиция #{p.ticket} {'закрыта' if ok else 'НЕ закрыта: ' + err} (P/L {p.profit:+.2f})")
+        return msgs
+
+    def reduce_half(self, rec):
+        """
+        Уменьшить объём сигнала вдвое (канал написал «большой стоп, занижайте лот» уже после входа).
+        Если позиции можно поделить — частично закрываем каждую; если они минимальные (0.01) —
+        закрываем целые позиции, начиная со средней (остаются TP1 и дальний тейк, как при входе с ÷2).
+        """
+        msgs = []
+        items = [("pos", p, self.k_of(rec, p.identifier, p.comment) or 0, float(p.volume)) for p in self.positions_of(rec)]
+        items += [("ord", o, self.k_of(rec, o.ticket, o.comment) or 0, float(o.volume_current)) for o in self.pending_of(rec)]
+        if not items:
+            return msgs
+        info = self.mt5.symbol_info(items[0][1].symbol)
+        step, vmin, eps = info.volume_step, info.volume_min, 1e-9
+        total = sum(v for *_, v in items)
+        target = total / 2
+        if all(math.floor(v / 2 / step + eps) * step >= vmin - eps for *_, v in items):
+            for kind, x, k, v in items:
+                keep = round(math.floor(v / 2 / step + eps) * step, 8)
+                cut = round(v - keep, 8)
+                if kind == "pos":
+                    ok, _, err = self.close_position(x, volume=cut)
+                    msgs.append(f"TP{k}: закрыто {cut:g} из {v:g}" + ("" if ok else f" НЕ удалось: {err}"))
+                else:
+                    ok, _, err = self.cancel_order(x)
+                    msgs.append(f"лимитка TP{k} {'снята' if ok else 'НЕ снята: ' + err} (перевыставлять частично не умею)")
+            return msgs
+        # минимальные позиции: закрываем целиком, средние тейки первыми
+        ks = sorted({k for _, _, k, _ in items})
+        order = [k for k in ks[1:-1]] + ks[-1:] if len(ks) > 2 else ks[-1:]
+        left = total
+        for k in order:
+            for kind, x, kk, v in items:
+                if kk != k or left - v < target - eps:   # не опускаемся ниже половины
+                    continue
+                if kind == "pos":
+                    ok, _, err = self.close_position(x)
+                    msgs.append(f"позиция TP{k} {v:g} закрыта ({x.profit:+.2f})" + ("" if ok else f" НЕ удалось: {err}"))
+                else:
+                    ok, _, err = self.cancel_order(x)
+                    msgs.append(f"лимитка TP{k} {'снята' if ok else 'НЕ снята: ' + err}")
+                left -= v
         return msgs
 
     def cancel_pending(self, rec):

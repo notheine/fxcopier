@@ -110,7 +110,7 @@ def entries_blocked():
         return "нет связи с MT5"
     wk = CFG.get("weekend", {})
     n = now_msk()
-    if wk.get("enabled", True) and n.weekday() == 4:
+    if wk.get("enabled", False) and n.weekday() == 4:
         hh, mm = map(int, wk.get("no_new_entries_after", "22:00").split(":"))
         if (n.hour, n.minute) >= (hh, mm):
             return "пятница вечер — новые сделки не открываю (на выходные не оставляем)"
@@ -187,6 +187,7 @@ async def handle_signal(msg, text, sig):
     except Exception as e:
         log.exception("ошибка подготовки")
         plan, text_plan = None, f"⚠️ Ошибка: {e}"
+    rec["reduced"] = bool(plan and plan.get("reduced"))
     reasons = guard_trade(plan, times) if plan else []
     if plan and DRY:
         rec["reason"] = "тестовый режим"
@@ -420,6 +421,7 @@ async def handle_command(msg, text, cmds):
                                  alt="Ответьте /slok — перенести, /slno — оставить")
                     lines.append("жду вашего решения по переносу стопа")
                 elif _plausible(rec, c.price):
+                    rec["sl_changed"] = True
                     lines += trader.set_sl(rec, c.price) or ["нет открытых позиций"]
                 else:
                     lines.append(f"стоп {c.price:g} выглядит неправдоподобно — не меняю")
@@ -430,6 +432,26 @@ async def handle_command(msg, text, cmds):
                     lines.append(f"тейк {c.price:g} выглядит неправдоподобно — не меняю")
             elif c.kind == "cancel":
                 lines += trader.cancel_pending(rec) or ["лимиток нет"]
+            elif c.kind == "no_be":
+                # канал важнее автоматики: трейдер держит исходный стоп — возвращаем его
+                rec["no_auto_be"] = True
+                if rec.get("be_done") and not rec.get("sl_changed"):
+                    res = trader.set_sl(rec, rec["sl"])
+                    rec["be_done"] = False
+                    lines.append(f"канал держит исходный стоп — возвращаю {rec['sl']:g}")
+                    lines += res
+                else:
+                    lines.append("автоперенос в безубыток для этой сделки выключен")
+            elif c.kind == "reduce":
+                age = time.time() - rec["created"]
+                if rec.get("reduced"):
+                    lines.append("лот уже уменьшен при входе")
+                elif age > CFG["risk"].get("reduce_window_min", 15) * 60:
+                    lines.append(f"сигнал открыт {age / 60:.0f} мин назад — лот не трогаю")
+                else:
+                    res = trader.reduce_half(rec)
+                    rec["reduced"] = True
+                    lines += res or ["уменьшать нечего (одна минимальная позиция)"]
             elif c.kind == "unknown":
                 lines.append("❓ не понял, что делать — проверьте сами, при необходимости действуйте вручную "
                              "или командой /closeall")
@@ -535,15 +557,15 @@ async def daily_checks():
     if state.d["day"] != today:
         state.d.update(day=today, day_equity=acc.equity, day_paused=False)
         state.save()
-    lim = CFG["risk"].get("max_daily_loss_pct", 10)
+    lim = CFG["risk"].get("max_daily_loss_pct") or 0      # 0 / пусто — лимита нет (у куратора его нет)
     base = state.d["day_equity"] or acc.equity
-    if not state.d["day_paused"] and acc.equity <= base * (1 - lim / 100):
+    if lim > 0 and not state.d["day_paused"] and acc.equity <= base * (1 - lim / 100):
         state.d["day_paused"] = True
         state.save()
         await notify(f"🛑 Дневной лимит убытка {lim}% достигнут (эквити {acc.equity:.2f} при старте дня {base:.2f}). "
                      "Новые сигналы пропускаю до завтра. Открытые сделки веду дальше.")
     wk = CFG.get("weekend", {})
-    if wk.get("enabled", True) and n.weekday() == 4:
+    if wk.get("enabled", False) and n.weekday() == 4:
         hh, mm = map(int, wk.get("close_all_at", "23:30").split(":"))
         if (n.hour, n.minute) >= (hh, mm) and state.d["weekend_done"] != today:
             state.d["weekend_done"] = today
@@ -581,7 +603,8 @@ async def check_signal(rec):
     buy = rec["side"] == "BUY"
     reached = (bid >= tp1) if buy else (ask <= tp1)
 
-    if pos and not rec["be_done"] and reached and CFG["management"].get("auto_be_after_tp1", True):
+    if (pos and not rec["be_done"] and reached and not rec.get("no_auto_be")
+            and CFG["management"].get("auto_be_after_tp1", True)):
         rec["be_done"] = True
         res = trader.move_to_be(rec)
         state.save()

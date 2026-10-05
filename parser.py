@@ -164,6 +164,8 @@ class Command:
             "sl": f"перенести стоп на {self.price:g}" if self.price else "перенести стоп",
             "tp": f"TP{self.tp_index} → {self.price:g}" if self.price else "изменить тейк",
             "cancel": "отменить лимитный ордер",
+            "no_be": "стоп в безубыток пока НЕ переносить",
+            "reduce": "уменьшить лот вдвое (большой стоп)",
             "unknown": "непонятная команда",
         }
         return names.get(self.kind, self.kind)
@@ -211,6 +213,10 @@ CANCEL_RE = re.compile(
 # слова, указывающие что сообщение, возможно, про действие, которое мы не распознали
 NEGATION_RE = re.compile(r"пока\s+не\s+(переставля|перенош|переношу|двига)|не\s+переставля\w*|не\s+перенос\w*", re.I)
 SUMMARY_RE = re.compile(r"^\W*(итог\w*\s+(дня|недели|месяца)|результаты\s+(дня|недели))|сработал\w*\s+лимит", re.I)
+# «Большой стоп, соблюдаем риски», «Занижаем риск стоп длинный» — отдельным сообщением после сигнала
+REDUCE_CMD_RE = re.compile(
+    r"(больш|длинн)\w*\s+стоп|стоп\w*(\s+лос\w*)?\s+(больш|длинн)|(занижа|уменьша|снижа)\w*\s+(лот|риск|объ)", re.I)
+BE_WORD_RE = re.compile(r"бу\b|б/у|безубыт|без\s+убыт", re.I)
 MAX_CMD_LEN = 350
 ACTION_HINT_RE = re.compile(r"перезаход|пере\s+заход|закрыва|закрыть|частич|половин|лимитк|стоп\s+на|тейк\s+на|переставл|передвига", re.I)
 # отчёт о взятом тейке — ничего делать не нужно, тейки стоят в ордерах
@@ -250,6 +256,11 @@ def parse_command(text: str) -> list:
 
     if BE_RE.search(t) and not NEGATION_RE.search(t) and not any(c.kind == "sl" for c in cmds):
         cmds.append(Command("be"))
+    elif NEGATION_RE.search(t) and BE_WORD_RE.search(t):
+        cmds.append(Command("no_be"))
+
+    if REDUCE_CMD_RE.search(t) and len(t) <= 200:
+        cmds.append(Command("reduce"))
 
     if CANCEL_RE.search(t):
         cmds.append(Command("cancel"))

@@ -22,7 +22,10 @@ COMMANDS = {
     "Корректировка Стоп Лоса: переставляем на отметку 4333": "sl",
     "Не забудьте про то что третий тейк другой, в сигнале опечатка\nтретий тейк на 3997": "tp",
     "Сделка закрылась по стопу 🔴\n-300 points": "closed_report",
-    "Фиксирую 1/3 TP ✅\nСтоп в бу пока не переставляю, ожидайте апдейт по позиции\n+367 points": None,
+    "Фиксирую 1/3 TP ✅\nСтоп в бу пока не переставляю, ожидайте апдейт по позиции\n+367 points": "no_be",
+    "Большой стоп, соблюдаем риски": "reduce",
+    "Занижаем риск стоп длинный": "reduce",
+    "Соблюдайте риски, большой Стоплос": "reduce",
 }
 
 
@@ -53,6 +56,30 @@ def test_lots():
     assert plan_positions(0.025, [1, 2, 3], 0.01, 0.01) == [(1, .01), (3, .01)]
 
 
+def test_channel_priority():
+    """Лот ÷2 по сообщению канала после входа; уход цены от зоны к тейкам — пропуск, а не лимитка."""
+    from fake_mt5 import FakeMT5
+    from trader import Trader
+    cfg = {"magic": 770077, "lot_table": [[200, .01], [900, .05], [1500, .06], [2000, .08]], "risk": {},
+           "symbols": {"GOLD": {"enabled": True, "candidates": ["GOLD"], "entry_tolerance": 2.0, "max_spread": 1.0,
+                                "max_slippage": 0.5, "be_offset": 0.3, "min_sl_gap": 1.0}}}
+    sig = parse_signal("GOLD BUY\n4398-4402\nTP1: 4405\nTP2: 4410\nTP3: 4420\nSL: 4380")
+    for bal, before, after in ((1000, [.01, .01, .01], [.01, .01]), (2000, [.02, .02, .02], [.01, .01, .01])):
+        f = FakeMT5(bal); f.bid = 4400.0
+        t = Trader(cfg, f)
+        plan, _ = t.prepare(1, sig)
+        orders, _ = t.execute(plan)
+        rec = {"id": 1, "orders": orders}
+        assert sorted(p.volume for p in f.positions_get()) == before
+        t.reduce_half(rec)
+        assert sorted(round(p.volume, 2) for p in f.positions_get()) == after, f.positions_get()
+        if bal == 1000:   # остались TP1 и дальний тейк
+            assert sorted(t.k_of(rec, p.identifier, p.comment) for p in f.positions_get()) == [1, 3]
+    f = FakeMT5(1000); f.bid = 4404.0                 # цена ушла выше зоны к тейкам
+    plan, why = Trader(cfg, f).prepare(2, sig)
+    assert plan is None and "ушла" in why, why
+
+
 def test_guard():
     g = G.settings({})
     base = dict(symbol_key="GOLD", plan_lot=0.03, table_lot=0.05, sl_distance=17, balance=1000,
@@ -71,6 +98,6 @@ def test_guard():
 
 
 if __name__ == "__main__":
-    for f in (test_signals, test_commands, test_entry, test_lots, test_guard):
+    for f in (test_signals, test_commands, test_entry, test_lots, test_channel_priority, test_guard):
         f()
     print("OK")

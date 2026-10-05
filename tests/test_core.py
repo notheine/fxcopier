@@ -43,11 +43,23 @@ def test_commands():
 
 def test_entry():
     s = parse_signal("TRADE GOLD SELL\n4167-4175\nTP1: 4165\nTP2: 4161\nTP3: 4149\nSL: 4187")
-    assert decide_entry(s, 4170, 4170.2, 2, 1)[0] == "market"
-    assert decide_entry(s, 4184.67, 4184.8, 2, 1)[0] == "skip"     # ушла за зону к стопу
+    # SELL, середина диапазона 4171: цена 4172 (лучше точки) — по рынку; 4169 (хуже) — SELL LIMIT 4171
+    assert decide_entry(s, 4172, 4172.2, 2, 1)[0] == "market"
+    assert decide_entry(s, 4169, 4169.2, 2, 1)[:2] == ("limit", 4171.0)
+    assert decide_entry(s, 4184.67, 4184.8, 2, 1)[0] == "skip"     # выше диапазона, к стопу — не входим
+    assert decide_entry(s, 4184.67, 4184.8, 2, 1, stop_orders=True)[:2] == ("stop", 4175.0)
     assert decide_entry(s, 4163, 4163.2, 2, 1)[0] == "skip"        # TP1 уже пройден
-    b = parse_signal("GOLD BUY\n4317-4308\nTP1: 4321\nTP2: 4325\nTP3: 4337\nSL: 4300")
-    assert decide_entry(b, 4319.8, 4320, 2, 1)[0] == "limit"
+    # 05.10 #1313: диапазон 4158-4155, середина 4156.5 — по 4159.04 НЕ входим, ставим BUY LIMIT 4156.5
+    c = parse_signal("TRADE GOLD BUY\n\n4158-4155\n\n✅TP1: 4161\n✅TP2: 4164\n✅TP3: 4172\n\n🔴SL: 4151")
+    assert decide_entry(c, 4158.89, 4159.04, 2, 0.3)[:2] == ("limit", 4156.5)
+    assert decide_entry(c, 4157.5, 4157.65, 2, 0.3)[:2] == ("limit", 4156.5)  # внутри, но хуже середины
+    assert decide_entry(c, 4155.5, 4155.65, 2, 0.3)[0] == "market"           # нижняя половина — по рынку
+    assert decide_entry(c, 4158.89, 4159.04, 2, 0.3, level=0)[:2] == ("limit", 4155.0)
+    assert decide_entry(c, 4158.89, 4159.04, 2, 0.3, level=1)[:2] == ("limit", 4158.0)
+    assert decide_entry(c, 4153.0, 4153.15, 2, 0.3)[0] == "skip"             # ниже диапазона
+    d = parse_signal("SELL XAUUSD\n4075\nTake profit 1: 4069\nTake profit 2: 4065\nTake profit 3: 4060\nStop loss : 4082")
+    assert decide_entry(d, 4075.5, 4075.65, 2, 0.3)[0] == "market"            # одна цена: диапазон ±2$, точка 4075
+    assert decide_entry(d, 4073.5, 4073.65, 2, 0.3)[:2] == ("limit", 4075.0)
 
 
 def test_lots():
@@ -65,7 +77,7 @@ def test_channel_priority():
                                 "max_slippage": 0.5, "be_offset": 0.3, "min_sl_gap": 1.0}}}
     sig = parse_signal("GOLD BUY\n4398-4402\nTP1: 4405\nTP2: 4410\nTP3: 4420\nSL: 4380")
     for bal, before, after in ((1000, [.01, .01, .01], [.01, .01]), (2000, [.02, .02, .02], [.01, .01, .01])):
-        f = FakeMT5(bal); f.bid = 4400.0
+        f = FakeMT5(bal); f.bid = 4399.5
         t = Trader(cfg, f)
         plan, _ = t.prepare(1, sig)
         orders, _ = t.execute(plan)
@@ -75,9 +87,18 @@ def test_channel_priority():
         assert sorted(round(p.volume, 2) for p in f.positions_get()) == after, f.positions_get()
         if bal == 1000:   # остались TP1 и дальний тейк
             assert sorted(t.k_of(rec, p.identifier, p.comment) for p in f.positions_get()) == [1, 3]
-    f = FakeMT5(1000); f.bid = 4404.0                 # цена ушла выше зоны к тейкам
-    plan, why = Trader(cfg, f).prepare(2, sig)
-    assert plan is None and "ушла" in why, why
+    f = FakeMT5(1000); f.bid = 4403.0                 # цена выше диапазона 4398–4402 → BUY LIMIT по середине 4400
+    t = Trader(cfg, f)
+    plan, why = t.prepare(2, sig)
+    assert plan["action"] == "limit" and plan["price"] == 4400.0, why
+    orders, _ = t.execute(plan)
+    assert len(f.orders_get()) == 3 and not f.positions_get()
+    f.tick(4399.8)                                     # цена дошла до точки входа — ордера исполнились
+    assert len(f.positions_get()) == 3 and all(p.price_open == 4400.0 for p in f.positions_get())
+    cfg["risk"]["entry_level"] = 0.0                   # настройка владельца: лучший край
+    f = FakeMT5(1000); f.bid = 4399.0
+    plan, why = Trader(cfg, f).prepare(3, sig)
+    assert plan["action"] == "limit" and plan["price"] == 4398.0, why
 
 
 def test_guard():

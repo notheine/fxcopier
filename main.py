@@ -64,6 +64,21 @@ class State:
 
 
 state = State()
+
+
+def entry_level():
+    """Точка входа в диапазоне сигнала: 0 — лучший край, 1 — худший. Владелец меняет командой /entry."""
+    lvl = state.d.get("entry_level")
+    if lvl is None:
+        lvl = CFG.setdefault("risk", {}).get("entry_level", 0.5)
+    CFG.setdefault("risk", {})["entry_level"] = float(lvl)
+    return float(lvl)
+
+
+def entry_level_text():
+    return (f"Точка входа: {entry_level() * 100:.0f}% диапазона сигнала "
+            "(0% — лучший край: у BUY нижний, у SELL верхний; 100% — худший). "
+            "Цена хуже — ставлю BUY/SELL LIMIT на эту точку. Изменить: /entry 30")
 link = None
 trader = None
 client = TelegramClient(os.path.join(BASE, "session"), int(CFG["telegram"]["api_id"]),
@@ -217,10 +232,10 @@ async def finish_open(rec, sig, orders, rep, head):
         rec["status"] = "active"
         rec["orders"] = orders
         rec["symbol"] = trader.symbol(sig.symbol)
-        if any(o["kind"] == "limit" for o in orders):
+        if any(o["kind"] in ("limit", "stop") for o in orders):
             rec["pending_since"] = time.time()
-            rec["pending_expiry_min"] = (CFG["risk"].get("limit_signal_expiry_min", 240) if sig.is_limit
-                                         else CFG["risk"].get("late_entry_expiry_min", 20))
+            rec["pending_expiry_min"] = (CFG["risk"].get("limit_signal_expiry_min", 10080) if sig.is_limit
+                                         else CFG["risk"].get("pending_expiry_min", 240))
     else:
         rec["reason"] = rep.replace("не вхожу: ", "").split(" — ")[0][:80]
     state.signals[sid] = rec
@@ -595,8 +610,8 @@ async def check_signal(rec):
     if pos and not rec.get("filled"):
         rec["filled"] = True
         state.save()
-        if any(o["kind"] == "limit" for o in rec["orders"]):
-            await notify(f"🎯 Сигнал #{rec['id']}: лимитный ордер исполнился — мы в позиции "
+        if any(o["kind"] in ("limit", "stop") for o in rec["orders"]):
+            await notify(f"🎯 Сигнал #{rec['id']}: отложенный ордер исполнился — мы в позиции "
                          f"({len(pos)} шт. @ {pos[0].price_open:g})")
     bid, ask = trader.price(rec["symbol"])
     tp1 = min(rec["tps"].items(), key=lambda kv: int(kv[0]))[1]
@@ -617,6 +632,8 @@ async def check_signal(rec):
         why = None
         if reached:
             why = f"цена дошла до TP1 {tp1:g} без нас"
+        elif (bid <= rec["sl"]) if buy else (ask >= rec["sl"]):
+            why = f"цена дошла до стопа {rec['sl']:g} без нас"
         elif time.time() - rec.get("pending_since", rec["created"]) > exp:
             why = f"лимитка не исполнилась за {exp // 60:.0f} мин"
         if why:
@@ -746,7 +763,8 @@ async def scheduled_reports():
 
 # ------------------------------------------------------------------ команды в «Избранном»
 
-HELP = ("Команды (пишите сюда):\n/status — счёт и открытые сделки\n/report — отчёт за день (/report week, /report month)\n/pause — не входить в новые сигналы\n"
+HELP = ("Команды (пишите сюда):\n/status — счёт и открытые сделки\n"
+        "/entry — точка входа в диапазоне сигнала (/entry 50 — середина, /entry 0 — лучший край)\n/report — отчёт за день (/report week, /report month)\n/pause — не входить в новые сигналы\n"
         "/resume — снова входить\n/closeall — закрыть ВСЕ сделки копировщика и снять лимитки\n"
         "/approve, /approve_safe, /reject — решение по сделке, остановленной защитой (если нет кнопок)\n/help — эта справка")
 
@@ -767,18 +785,37 @@ async def handle_user_command(cmd, arg=""):
         kind = {"week": "week", "неделя": "week", "month": "month", "месяц": "month"}.get(arg.strip().lower(), "day")
         await notify(build_report(kind))
         return
+    if cmd == "entry":
+        a = arg.strip().replace("%", "").replace(",", ".")
+        if a:
+            try:
+                v = float(a)
+                v = v / 100 if v > 1 else v
+                if not 0 <= v <= 1:
+                    raise ValueError
+            except ValueError:
+                await notify("Укажите число от 0 до 100, например /entry 50")
+                return
+            state.d["entry_level"] = v
+            state.save()
+            entry_level()
+            await notify("✅ Сохранено. " + entry_level_text())
+        else:
+            await notify(entry_level_text())
+        return
     if cmd == "status":
         acc = trader.account()
         pos, orders = trader.all_own()
         lines = [f"Режим: {MODE} | счёт {acc.login} ({'демо' if acc.trade_mode == link.ACCOUNT_TRADE_MODE_DEMO else 'РЕАЛЬНЫЙ'})",
                  f"Баланс {acc.balance:.2f}, эквити {acc.equity:.2f} {acc.currency}",
                  f"Пауза: {'да' if state.d['paused'] else 'нет'}; дневной стоп: {'да' if state.d['day_paused'] else 'нет'}",
-                 f"MT5: {'на связи' if mt5_ok else 'НЕТ СВЯЗИ'}"]
+                 f"MT5: {'на связи' if mt5_ok else 'НЕТ СВЯЗИ'}",
+                 "📍 " + entry_level_text()]
         for p in pos:
             lines.append(f"• {p.symbol} {'BUY' if p.type == 0 else 'SELL'} {p.volume:g} @ {p.price_open:g} "
                          f"SL {p.sl:g} TP {p.tp:g} → {p.profit:+.2f}")
         for o in orders:
-            lines.append(f"• лимитка {o.symbol} {o.volume_current:g} @ {o.price_open:g}")
+            lines.append(f"• отложенный ордер {o.symbol} {o.volume_current:g} @ {o.price_open:g}")
         if not pos and not orders:
             lines.append("Открытых сделок нет.")
         await notify("\n".join(lines))
@@ -905,7 +942,7 @@ async def main():
     warn = "" if trader.trade_allowed() else "\n⚠️ В терминале выключена алготорговля (Algo Trading) — ордера не пройдут!"
     await notify(f"🚀 Копировщик запущен. Режим: {MODE}{' (только разбор, без ордеров)' if DRY else ''}\n"
                  f"Канал: {channel_entity.title}\nСчёт {acc.login} ({'демо' if is_demo else 'РЕАЛЬНЫЙ'}), "
-                 f"баланс {acc.balance:.2f} {acc.currency}{warn}\n/help — команды")
+                 f"баланс {acc.balance:.2f} {acc.currency}{warn}\n📍 {entry_level_text()}\n/help — команды")
 
     @client.on(events.NewMessage(chats=channel_entity))
     async def on_new(event):

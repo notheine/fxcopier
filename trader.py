@@ -41,37 +41,55 @@ def plan_positions(total: float, tp_keys: list, vmin: float, vstep: float):
     return []
 
 
-def decide_entry(sig, bid: float, ask: float, tol: float, min_sl_gap: float):
+def entry_price(sig, tol: float, level: float):
     """
-    Решение о входе.
-    Возвращает (действие, цена, пояснение), действие: market | limit | skip.
+    Цена входа внутри диапазона открытия. level — точка в диапазоне от «лучшего» края к «худшему»:
+    0 — самый выгодный край (BUY: нижний, SELL: верхний), 1 — самый невыгодный, 0.5 — середина.
+    Одна цена в сигнале («4075») → диапазон цена ± tol.
+    Возвращает (низ, верх, цена_входа).
     """
     lo, hi = sig.zone
+    if hi - lo < 0.005:
+        lo, hi = lo - tol, hi + tol
+    level = min(max(level, 0.0), 1.0)
+    best, worst = (lo, hi) if sig.side == "BUY" else (hi, lo)
+    return lo, hi, round(best + level * (worst - best), 2)
+
+
+def decide_entry(sig, bid: float, ask: float, tol: float, min_sl_gap: float, level: float = 0.5,
+                 stop_orders: bool = False):
+    """
+    Решение о входе. Диапазон из сигнала («4158-4155») — диапазон открытия; входим только внутри него,
+    не хуже точки входа E = entry_price(level).
+      market — цена внутри диапазона и не хуже E (BUY: от нижнего края до E);
+      limit  — цена хуже E (внутри диапазона или за ним в сторону тейков): BUY LIMIT / SELL LIMIT по E;
+      stop   — (только если stop_orders) цена за диапазоном в сторону стопа: BUY STOP / SELL STOP
+               на ближнем крае — вход, когда цена вернётся в диапазон;
+      skip   — цена за диапазоном в сторону стопа (по умолчанию), за стопом, уже прошла TP1
+               или вплотную к стопу.
+    """
+    lo, hi, e = entry_price(sig, tol, level)
     tp1 = sig.tps[min(sig.tps)]
     buy = sig.side == "BUY"
-    price = ask if buy else bid
+    price = round(ask if buy else bid, 5)
     s = 1 if buy else -1
+    rng = f"{lo:g}–{hi:g}"
     if s * (price - sig.sl) <= 0:
-        return "skip", None, f"цена {price} уже за стопом {sig.sl}"
+        return "skip", None, f"цена {price:g} уже за стопом {sig.sl:g}"
     if s * (price - tp1) >= 0:
-        return "skip", None, f"цена {price} уже дошла до TP1 {tp1}"
-    if abs(price - sig.sl) <= min_sl_gap:
-        return "skip", None, f"цена {price} слишком близко к стопу {sig.sl}"
-    in_zone = lo - tol <= price <= hi + tol
-    # «хорошая» сторона зоны — ближе к тейкам (для BUY выше зоны, для SELL ниже)
-    edge = hi if buy else lo
-    beyond_to_tp = s * (price - edge) > 0 and not in_zone
-    if sig.is_limit:
-        if s * (price - edge) > 0:
-            return "limit", edge, "лимитный ордер по сигналу"
-        if in_zone:
-            return "market", price, "цена уже в зоне лимитки"
-        return "skip", None, f"цена {price} ушла за зону {lo:g}–{hi:g} в сторону стопа"
-    if in_zone:
-        return "market", price, "цена в зоне входа"
-    if beyond_to_tp:
-        return "limit", edge, f"цена {price} ушла от зоны к тейкам, ждём отката к {edge:g}"
-    return "skip", None, f"цена {price} ушла за зону {lo:g}–{hi:g} в сторону стопа — не вхожу"
+        return "skip", None, f"цена {price:g} уже дошла до TP1 {tp1:g}"
+    if abs(e - sig.sl) <= min_sl_gap:
+        return "skip", None, f"точка входа {e:g} вплотную к стопу {sig.sl:g}"
+    best = lo if buy else hi
+    if s * (price - e) <= 0 and s * (price - best) >= 0:
+        return "market", price, f"цена {price:g} в диапазоне {rng}, не хуже точки входа {e:g}"
+    if s * (price - e) > 0:
+        kind = "BUY LIMIT" if buy else "SELL LIMIT"
+        return "limit", e, f"цена {price:g} хуже точки входа {e:g} (диапазон {rng}) — {kind} {e:g}"
+    if stop_orders:
+        kind = "BUY STOP" if buy else "SELL STOP"
+        return "stop", best, f"цена {price:g} за диапазоном {rng} в сторону стопа — {kind} {best:g}"
+    return "skip", None, f"цена {price:g} за диапазоном {rng} в сторону стопа — не вхожу"
 
 
 # ---------------------------------------------------------------- работа с MT5
@@ -192,10 +210,10 @@ class Trader:
 
         stops_gap = max(int(info.trade_stops_level), 0) * info.point
         min_gap = max(stops_gap, spread * 2, sc.get("min_sl_gap", 0))
-        action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap)
-        if action == "limit" and not sig.is_limit and not self.cfg.get("risk", {}).get("late_entry_limit", False):
-            # правило куратора: входить только на точке входа (допуск $2); цена ушла — сделку пропускаем
-            action, why = "skip", f"цена ушла от зоны входа больше чем на {sc.get('entry_tolerance', 0):g}$"
+        rk = self.cfg.get("risk", {})
+        action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap,
+                                          level=float(rk.get("entry_level", 0.5)),
+                                          stop_orders=bool(rk.get("out_of_range_stop", False)))
         if action == "skip":
             return None, f"не вхожу: {why}"
 
@@ -216,7 +234,8 @@ class Trader:
         except Exception:
             pass
         lots = " + ".join(f"{v:g}" for _, v in positions)
-        head = (f"{'ВХОД ПО РЫНКУ' if action == 'market' else 'ЛИМИТНЫЙ ОРДЕР'} {name} {sig.side} "
+        title = {"market": "ВХОД ПО РЫНКУ", "limit": "ЛИМИТНЫЙ ОРДЕР", "stop": "СТОП-ОРДЕР"}[action]
+        head = (f"{title} {name} {sig.side} "
                 f"@ {price:g} ({why}); лот {lots}" + (" (уменьшен вдвое)" if reduced else "")
                 + (" (уменьшен защитой по вашему решению)" if max_lot is not None else ""))
         plan = {"sid": sid, "sig": sig, "name": name, "info": info, "sc": sc, "action": action, "price": price,
@@ -252,7 +271,9 @@ class Trader:
             else:
                 req.update({
                     "action": self.mt5.TRADE_ACTION_PENDING,
-                    "type": self.mt5.ORDER_TYPE_BUY_LIMIT if buy else self.mt5.ORDER_TYPE_SELL_LIMIT,
+                    "type": ((self.mt5.ORDER_TYPE_BUY_LIMIT if buy else self.mt5.ORDER_TYPE_SELL_LIMIT)
+                             if action == "limit" else
+                             (self.mt5.ORDER_TYPE_BUY_STOP if buy else self.mt5.ORDER_TYPE_SELL_STOP)),
                     "price": self._norm(info, price),
                     "type_filling": self.mt5.ORDER_FILLING_RETURN,
                 })

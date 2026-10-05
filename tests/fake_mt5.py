@@ -1,7 +1,7 @@
 from types import SimpleNamespace as NS
 import itertools
 class FakeMT5:
-    ACCOUNT_TRADE_MODE_DEMO=0; ORDER_TYPE_BUY=0; ORDER_TYPE_SELL=1; ORDER_TYPE_BUY_LIMIT=2; ORDER_TYPE_SELL_LIMIT=3
+    ACCOUNT_TRADE_MODE_DEMO=0; ORDER_TYPE_BUY=0; ORDER_TYPE_SELL=1; ORDER_TYPE_BUY_LIMIT=2; ORDER_TYPE_SELL_LIMIT=3; ORDER_TYPE_BUY_STOP=4; ORDER_TYPE_SELL_STOP=5
     POSITION_TYPE_BUY=0; POSITION_TYPE_SELL=1; TRADE_ACTION_DEAL=1; TRADE_ACTION_PENDING=5; TRADE_ACTION_SLTP=6
     TRADE_ACTION_MODIFY=7; TRADE_ACTION_REMOVE=8; ORDER_FILLING_FOK=0; ORDER_FILLING_IOC=1; ORDER_FILLING_RETURN=2; ORDER_TIME_GTC=0
     def __init__(s, balance=1000.0):
@@ -54,8 +54,8 @@ class FakeMT5:
     def tick(s,bid):
         s.bid=round(bid,2); ask=s.bid+s.spread
         for o in list(s.ord.values()):
-            if (o.type==2 and ask<=o.price_open) or (o.type==3 and s.bid>=o.price_open):
-                s.ord.pop(o.ticket); s.pos[o.ticket]=NS(ticket=o.ticket,identifier=o.ticket,symbol=o.symbol,type=o.type-2,volume=o.volume_current,price_open=o.price_open,sl=o.sl,tp=o.tp,magic=o.magic,comment=o.comment)
+            if (o.type==2 and ask<=o.price_open) or (o.type==3 and s.bid>=o.price_open) or (o.type==4 and ask>=o.price_open) or (o.type==5 and s.bid<=o.price_open):
+                s.ord.pop(o.ticket); s.pos[o.ticket]=NS(ticket=o.ticket,identifier=o.ticket,symbol=o.symbol,type=(o.type-2)%2,volume=o.volume_current,price_open=(o.price_open if o.type<4 else (ask if o.type==4 else s.bid)),sl=o.sl,tp=o.tp,magic=o.magic,comment=o.comment)
         for p in list(s.pos.values()):
             if p.type==0:
                 if p.tp and s.bid>=p.tp: s._close(p,p.tp,'tp')

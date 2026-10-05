@@ -77,7 +77,7 @@ async def main():
     bot = TelegramClient("bot_session", int(tg["api_id"]), tg["api_hash"])
     await bot.start(bot_token=tg["bot_token"])
     await bot.send_message(tg["report_chat"], "👋 Я бот копировщика. Сюда буду присылать сигналы из канала и "
-                                              "каждое действие на счёте. Команды: /status /pause /resume /closeall /help")
+                                              "каждое действие на счёте. Команды: /status /entry /pause /resume /closeall /help")
     await bot.disconnect()
     await client.disconnect()
     print("Готово: бот", uname, "пишет в группу", tg["report_chat"])

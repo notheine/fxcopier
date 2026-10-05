@@ -3,7 +3,8 @@
 ## Ежедневное
 
 Всё приходит в группу «FxCopier — сделки» от бота. Команды там же:
-`/status`, `/report`, `/report week`, `/report month`, `/pause`, `/resume`, `/closeall`, `/help`.
+`/status`, `/entry`, `/report`, `/report week`, `/report month`, `/pause`, `/resume`, `/closeall`, `/help`.
+`/entry 30` — точка входа в диапазоне сигнала (0 — лучший край, 100 — худший; сейчас 50).
 
 На сервере: `fxctl status`, `fxctl logs`, `fxctl restart`, `fxctl mode …`.
 Логи: `/home/fx/copier/logs/copier.log`, `journalctl -u fx-mt5 -u fx-bridge -u fx-copier`.

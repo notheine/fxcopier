@@ -12,6 +12,8 @@ SIGNALS = {
     "Продажа XAUUSD\n📍4340-4343\n✅TP1: 4337\n✅TP2: 4330\n✅TP3: 4305\n🔴SL: 4349": ("SELL", True),
     "GOLD BUY\n4594-4598\n✅TР1: 4604\n✅TР2: 4608\n✅TР3: 46112\n🔴SL: 4592": ("BUY", False),        # опечатка TP3
     "GOLD SELL\n4515-4500\n✅TP1: 4519\n✅TP2: 4530\n✅TP3: 4545\n🔴SL: 4467": ("SELL", False),      # направление перепутано
+    "SELL XAUUSD\n4075\nTake profit 1: 4069\nTake profit 2: 4065\nTake profit 3: 4060\nStop loss : 4082": ("SELL", True),  # 13.07
+    "BUY XAUUSD\n4029-4030\nTake profit 1: 4035\nTake profit 2: 4039\nTake profit 3: 4045\nStop: 4021": ("BUY", True),   # 15.07
     "RISKY GOLD LIMIT BUY\nlimit buy 4333\n✅TP1: 4355\n✅TP2: 4376\n✅TP3: 4402\n🔴SL: 4309": ("BUY", True),
 }
 COMMANDS = {

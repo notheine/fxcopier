@@ -7,8 +7,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 NUM = r"(\d{2,6}(?:[.,]\d+)?)"
-TP_RE = re.compile(r"[tт]\s?[pр]\s*(\d)\s*[:=]?\s*" + NUM, re.I)
-SL_RE = re.compile(r"(?<![a-zа-я])[sс]\s?[lл]\s*[:=]?\s*" + NUM, re.I)
+# «TP1: 4035», «Tp 1: 4033», «Take profit 1: 4035», «Тейк 1: 4035»
+TP_RE = re.compile(r"(?:[tт]\s?[pр]|take\s*-?\s*profit|тейк(?:\s*-?\s*профит)?)\s*(\d)\s*[:=]?\s*" + NUM, re.I)
+# «SL: 4020», «Sl : 4044», «Stop loss : 4082», «Stop: 4021», «Стоп-лосс: 4021» (у слов двоеточие обязательно)
+SL_RE = re.compile(r"(?<![a-zа-я])(?:[sс]\s?[lл]\s*[:=]?|(?:stop\s*-?\s*loss|stop|стоп\s*-?\s*лос\w*|стоп)\s*[:=])\s*" + NUM, re.I)
 DIR_RE = re.compile(r"\b(BUY|SELL)\b|(покупк\w*|продаж\w*)", re.I)
 CNUM = r"(\d{3,6}(?:[.,]\d+)?)(?!\d|\s*(?:points|point|pips|pip|пипс|пункт|поинт))"
 

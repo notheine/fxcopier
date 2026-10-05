@@ -84,6 +84,21 @@ def entry_level_text():
             "Цена хуже точки — ставлю BUY/SELL LIMIT на неё. Изменить: /entry buy 20, /entry sell 80, /entry 50 (обе)")
 
 
+link = None
+trader = None
+client = TelegramClient(os.path.join(BASE, "session"), int(CFG["telegram"]["api_id"]),
+                        CFG["telegram"]["api_hash"], catch_up=True)
+NOTIFY = CFG["telegram"].get("notify_chat", "me")
+notify_peer = None   # сущность получателя отчётов (резолвится при старте)
+BOT_TOKEN = CFG["telegram"].get("bot_token")
+REPORT_CHAT = CFG["telegram"].get("report_chat")
+OWNER_IDS = set(CFG["telegram"].get("owner_ids", []))
+bot = TelegramClient(os.path.join(BASE, "bot_session"), int(CFG["telegram"]["api_id"]),
+                     CFG["telegram"]["api_hash"]) if BOT_TOKEN and REPORT_CHAT else None
+channel_entity = None
+mt5_ok = False
+
+
 async def notify(text: str, buttons=None, alt=""):
     """Отчёт в группу (от бота). buttons — кнопки; alt — текстовая подсказка, если бота нет."""
     log.info("NOTIFY: %s", text.replace("\n", " | "))

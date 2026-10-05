@@ -163,7 +163,7 @@ async def forward_signal(msg):
             log.error("не удалось отправить копию сигнала: %s", e2)
 
 
-async def handle_signal(msg, text, sig):
+async def handle_signal(msg, text, sig, late=False):
     sid = str(msg.id)
     rec = {"id": msg.id, "text": text, "created": time.time(), "symbol_key": sig.symbol, "side": sig.side,
            "zone": list(sig.zone), "tps": {str(k): v for k, v in sig.tps.items()}, "sl": sig.sl,
@@ -186,7 +186,17 @@ async def handle_signal(msg, text, sig):
         await notify(head + "\n⏸ Трейдер пишет, что ещё не вошёл — жду отдельного сигнала/подтверждения.")
         return
     age = time.time() - msg.date.timestamp()
-    if age > CFG["risk"].get("max_signal_age_sec", 120) and not sig.is_limit:
+    if late and age > CFG["risk"].get("max_signal_age_sec", 120):
+        # копировщик был недоступен (перезапуск/сбой) — сигнал догнали опросом канала
+        why = late_signal_problem(sig, msg, age)
+        if why:
+            rec["reason"] = "опоздание сигнала"
+            state.signals[sid] = rec
+            state.save()
+            await notify(head + f"\n⏭ Сигнал получен с опозданием {age / 60:.0f} мин (копировщик был недоступен): {why} — не вхожу.")
+            return
+        head += f"\n⚠️ Сигнал получен с опозданием {age / 60:.0f} мин (копировщик был недоступен); TP1 и стоп с тех пор не задеты — вхожу по обычным правилам."
+    elif age > CFG["risk"].get("max_signal_age_sec", 120) and not sig.is_limit:
         rec["reason"] = "опоздание сигнала"
         state.signals[sid] = rec
         state.save()
@@ -230,6 +240,35 @@ async def handle_signal(msg, text, sig):
     else:
         orders, rep = [], text_plan
     await finish_open(rec, sig, orders, rep, head)
+
+
+def late_signal_problem(sig, msg, age):
+    """Можно ли входить в пропущенный сигнал: не старше late_signal_max_min, TP1 и стоп с тех пор не задеты."""
+    lim = CFG["risk"].get("late_signal_max_min", 240)
+    if age > lim * 60:
+        return f"старше {lim} мин"
+    name = trader.symbol(sig.symbol)
+    if not name:
+        return "инструмент отключён"
+    try:
+        ext = trader.mt5.price_extremes(name, msg.date.timestamp(), time.time())
+    except Exception as e:
+        return f"не удалось проверить историю цен ({e})"
+    if not ext:
+        return "нет истории цен"
+    hi, lo = ext
+    tp1 = sig.tps[min(sig.tps)]
+    if sig.side == "BUY":
+        if hi >= tp1:
+            return f"цена уже доходила до TP1 {tp1:g}"
+        if lo <= sig.sl:
+            return f"цена уже доходила до стопа {sig.sl:g}"
+    else:
+        if lo <= tp1:
+            return f"цена уже доходила до TP1 {tp1:g}"
+        if hi >= sig.sl:
+            return f"цена уже доходила до стопа {sig.sl:g}"
+    return None
 
 
 async def finish_open(rec, sig, orders, rep, head):
@@ -859,6 +898,64 @@ async def handle_user_command(cmd, arg=""):
 
 # ------------------------------------------------------------------ запуск
 
+def _seen(mid):
+    return mid in state.d.setdefault("seen_ids", [])
+
+
+def _mark_seen(mid):
+    ids = state.d.setdefault("seen_ids", [])
+    ids.append(mid)
+    del ids[:-300]
+    state.d["last_msg_id"] = max(state.d.get("last_msg_id") or 0, mid)
+    state.save()
+
+
+async def process_channel_message(msg, late=False):
+    """Сообщение канала (из события или догнанное опросом). Каждое обрабатывается один раз."""
+    if _seen(msg.id):
+        return
+    _mark_seen(msg.id)
+    text = msg.message or ""
+    log.info("канал #%s%s: %s", msg.id, " (догнал опросом)" if late else "", text.replace("\n", " | ")[:300])
+    try:
+        sig = parse_signal(text, **CFG.get("sanity", {}))
+        if sig:
+            await forward_signal(msg)
+            await handle_signal(msg, text, sig, late=late)
+            return
+        cmds = parse_command(text)
+        if cmds:
+            await handle_command(msg, text, cmds)
+        elif looks_like_signal(text):
+            await notify(f"❓ Похоже на сигнал, но разобрать не смог:\n{text[:500]}")
+    except Exception as e:
+        log.exception("ошибка обработки")
+        await notify(f"⚠️ Ошибка при обработке сообщения #{msg.id}: {e}")
+
+
+async def poll_channel():
+    """
+    Страховка от пропусков: Telegram не всегда досылает сообщения, пришедшие во время перезапуска.
+    Раз в 20 с (и сразу при старте) читаем новые сообщения канала и обрабатываем те, что не видели.
+    """
+    if not state.d.get("last_msg_id"):
+        known = [int(k) for k in list(state.signals) + list(state.d.get("msg2sig", {})) if str(k).isdigit()]
+        state.d["last_msg_id"] = max(known) if known else 0
+        if not state.d["last_msg_id"]:
+            last = await client.get_messages(channel_entity, limit=1)
+            state.d["last_msg_id"] = last[0].id if last else 0
+        state.save()
+    while True:
+        try:
+            new = await client.get_messages(channel_entity, min_id=state.d["last_msg_id"], limit=50)
+            for m in sorted(new, key=lambda x: x.id):
+                if not _seen(m.id):
+                    await process_channel_message(m, late=True)
+        except Exception as e:
+            log.warning("опрос канала: %s", e)
+        await asyncio.sleep(CFG.get("poll_interval_sec", 20))
+
+
 async def find_channel():
     """Ищет канал. Сначала по запомненному ID, затем по названию. None — если доступа ещё нет."""
     want = str(CFG["telegram"]["channel"]).strip()
@@ -904,6 +1001,7 @@ async def main():
         if trader is None:
             await notify("Копировщик ещё ждёт доступа к каналу. Команды заработают после этого.")
             return
+        log.info("команда владельца: %s", event.raw_text[:100])
         await handle_user_command(event.pattern_match.group(1), event.raw_text.split(maxsplit=1)[1] if len(event.raw_text.split()) > 1 else "")
 
     if bot:
@@ -957,23 +1055,7 @@ async def main():
 
     @client.on(events.NewMessage(chats=channel_entity))
     async def on_new(event):
-        msg = event.message
-        text = msg.message or ""
-        log.info("канал #%s: %s", msg.id, text.replace("\n", " | ")[:300])
-        try:
-            sig = parse_signal(text, **CFG.get("sanity", {}))
-            if sig:
-                await forward_signal(msg)
-                await handle_signal(msg, text, sig)
-                return
-            cmds = parse_command(text)
-            if cmds:
-                await handle_command(msg, text, cmds)
-            elif looks_like_signal(text):
-                await notify(f"❓ Похоже на сигнал, но разобрать не смог:\n{text[:500]}")
-        except Exception as e:
-            log.exception("ошибка обработки")
-            await notify(f"⚠️ Ошибка при обработке сообщения #{msg.id}: {e}")
+        await process_channel_message(event.message)
 
     @client.on(events.MessageEdited(chats=channel_entity))
     async def on_edit(event):
@@ -984,6 +1066,7 @@ async def main():
             await notify(f"⚠️ Ошибка при обработке правки #{event.message.id}: {e}")
 
     asyncio.create_task(monitor())
+    asyncio.create_task(poll_channel())
     await client.run_until_disconnected()
 
 

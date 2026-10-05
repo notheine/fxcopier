@@ -89,3 +89,18 @@ class MT5Link:
     def history_deals_get(self, ts_from: int, ts_to: int):
         r = self.m.history_deals_get(int(ts_from), int(ts_to))
         return list(r) if r else []
+
+    def price_extremes(self, symbol: str, ts_from: float, ts_to: float):
+        """Максимум и минимум цены (bid, минутные свечи) за период в UTC-секундах. None — нет данных."""
+        import time as _t
+        tick = self.m.symbol_info_tick(symbol)
+        off = round((int(tick.time) - _t.time()) / 3600) * 3600 if tick else 0   # время сервера брокера
+        a, b = int(ts_from + off) - 60, int(ts_to + off) + 60
+        if self.remote:
+            r = self.conn.eval(f"(lambda r: None if r is None or len(r) == 0 else (float(max(r['high'])), "
+                               f"float(min(r['low']))))(mt5.copy_rates_range({symbol!r}, mt5.TIMEFRAME_M1, {a}, {b}))")
+            return tuple(r) if r else None
+        r = self.m.copy_rates_range(symbol, self.m.TIMEFRAME_M1, a, b)
+        if r is None or len(r) == 0:
+            return None
+        return float(max(r["high"])), float(min(r["low"]))

@@ -240,6 +240,11 @@ class Trader:
         else:
             action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap,
                                               level=level, stop_orders=bool(rk.get("out_of_range_stop", False)))
+            if mode == "split" and action == "limit" and not sig.is_limit:
+                # цена хуже точки входа: позиция TP1 — лимиткой на точку, TP2/TP3 — сразу по рынку
+                per_k = {min(sig.tps): ("limit", price)}
+                why += f"; TP2/TP3 — сразу по рынку {cur:g}"
+                action, price = "market", cur
         if action == "skip":
             return None, f"не вхожу: {why}"
 
@@ -272,7 +277,9 @@ class Trader:
                 "positions": positions, "lot": lot, "table_lot": table_lot, "sl_distance": sl_dist,
                 "risk": risk, "margin": margin, "head": head, "reduced": bool(reduced),
                 "per_k": {k: v for k, v in per_k.items() if v[0] != "skip"},
-                "be_k": min(k for k, _ in positions if k not in per_k) if per_k else None}
+                "be_k": (min(k for k, _ in positions if k not in per_k)
+                         if per_k and min(sig.tps) not in [k for k, _ in positions if k not in per_k]
+                         and s_ * (cur - tp1) >= 0 else None)}
         return plan, head
 
     def execute(self, plan):

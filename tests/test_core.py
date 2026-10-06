@@ -168,6 +168,12 @@ def test_entry_modes():
     cfg["risk"] = {"entry_level": 0.2, "below_range": "market"}
     f = FakeMT5(1000); f.bid = 4152.0                  # ниже диапазона: по рынку вместо пропуска
     assert Trader(cfg, f).prepare(6, s2)[0]["action"] == "market"
+    s3 = parse_signal("GOLD SELL\n4155-4158\nTP1: 4150\nTP2: 4145\nTP3: 4140\nSL: 4170")
+    f = FakeMT5(1000); f.bid = 4161.0                  # SELL зеркально: цена выше диапазона — по рынку
+    plan, why = Trader(cfg, f).prepare(7, s3)
+    assert plan["action"] == "market" and len(plan["positions"]) == 3, why
+    f.bid = 4169.5                                     # вплотную к стопу — не входим
+    assert Trader(cfg, f).prepare(8, s3)[0] is None
 
 
 def test_guard():

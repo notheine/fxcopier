@@ -82,7 +82,10 @@ def entry_level_text():
     b, s_ = entry_level("BUY"), entry_level("SELL")
     return (f"Точка входа в диапазоне сигнала: покупки {b * 100:.0f}%, продажи {s_ * 100:.0f}% "
             "(0% — лучший край: у BUY нижний, у SELL верхний; 100% — худший). "
-            "Цена хуже точки — ставлю BUY/SELL LIMIT на неё. Изменить: /entry buy 20, /entry sell 80, /entry 50 (обе)")
+            "Цена хуже точки — ставлю BUY/SELL LIMIT на неё. "
+            + ("Цена лучше диапазона (BUY — ниже, SELL — выше) — все три по рынку (куратор). "
+               if CFG.get("risk", {}).get("below_range") == "market" else "")
+            + "Изменить: /entry buy 20, /entry sell 80, /entry 50 (обе)")
 
 
 link = None

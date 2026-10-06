@@ -202,7 +202,8 @@ SL_TO_TP_RE = re.compile(r"(без\s*убыт\w*|бу\b|б/у|стоп\w*)[^\d\n
 TP_MOVE_RES = [
     re.compile(r"(\d)\s*/\s*\d\s*[tт][pр][^\d\n]{0,10}(корректир|перемещ|переставл|перенос)\w*[^\d\n]{0,25}" + CNUM, re.I),
     re.compile(r"корректировк\w*\s+(\d)\s*/\s*\d\s*[tт][pр][^\d\n]{0,30}?" + CNUM, re.I),
-    re.compile(r"(перв|втор|трет|четв)\w*\s+тейк[^\d\n]{0,25}?" + CNUM, re.I),
+    re.compile(r"(перв|втор|трет|четв)\w*\s+(?:тейк|[tт][pр]\b|тп\b)[^\d\n]{0,25}?" + CNUM, re.I),
+    re.compile(r"(?:отодвига|сдвига|передвига|переставля|перенос)\w*\s+[tт][pр]\s*(\d)[^\d\n]{0,25}?" + CNUM, re.I),
     re.compile(r"[tт][pр]\s*(\d)\s+значени\w*\s*" + CNUM, re.I),
 ]
 CANCEL_RE = re.compile(

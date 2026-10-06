@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sys
+from types import SimpleNamespace
 import time
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
@@ -219,6 +220,8 @@ async def handle_signal(msg, text, sig, late=False):
         log.exception("ошибка подготовки")
         plan, text_plan = None, f"⚠️ Ошибка: {e}"
     rec["reduced"] = bool(plan and plan.get("reduced"))
+    if plan and plan.get("be_k"):
+        rec["be_k"] = plan["be_k"]     # вошли после TP1: безубыток — когда цена дойдёт до нашего первого тейка
     reasons = guard_trade(plan, times) if plan else []
     if plan and DRY:
         rec["reason"] = "тестовый режим"
@@ -438,7 +441,39 @@ def resolve_target(msg):
     return act[0], note
 
 
+async def retry_skipped_on_tp_change(msg, cmds):
+    """
+    Канал сдвинул тейк у сигнала, который мы пропустили из-за «цена уже прошла TP1»
+    (05.10 #1332 → «Отодвигаю первый TP на 4190» через 24 с). Пересматриваем вход с новыми тейками.
+    """
+    tp_cmds = [c for c in cmds if c.kind == "tp" and c.price]
+    if not tp_cmds:
+        return False
+    rid = str(msg.reply_to.reply_to_msg_id) if msg.reply_to else None
+    cands = [r for r in state.signals.values()
+             if r["status"] == "skipped" and "TP1" in (r.get("reason") or "")
+             and time.time() - r["created"] < 600 and (rid is None or str(r["id"]) == rid)]
+    act = state.active()
+    if not cands or (rid is None and act and act[0]["created"] > max(r["created"] for r in cands)):
+        return False
+    rec = max(cands, key=lambda r: r["created"])
+    sig = parse_signal(rec["text"], **CFG.get("sanity", {}))
+    if not sig or not sig.valid:
+        return False
+    for c in tp_cmds:
+        if c.tp_index in sig.tps and _plausible(rec, c.price):
+            sig.tps[c.tp_index] = c.price
+    await notify(f"📣 Канал изменил тейк у пропущенного сигнала #{rec['id']} ("
+                 + ", ".join(c.describe() for c in tp_cmds) + ") — пересматриваю вход")
+    fake = SimpleNamespace(id=rec["id"], message=rec["text"], reply_to=None,
+                           date=dt.datetime.fromtimestamp(time.time(), dt.timezone.utc))
+    await handle_signal(fake, rec["text"], sig)
+    return True
+
+
 async def handle_command(msg, text, cmds):
+    if await retry_skipped_on_tp_change(msg, cmds):
+        return
     rec, how = resolve_target(msg)
     if rec is None:
         if any(c.kind == "unknown" for c in cmds):
@@ -655,21 +690,26 @@ async def check_signal(rec):
     if pos and not rec.get("filled"):
         rec["filled"] = True
         state.save()
-        if any(o["kind"] in ("limit", "stop") for o in rec["orders"]):
+        if all(o["kind"] in ("limit", "stop") for o in rec["orders"]):
             await notify(f"🎯 Сигнал #{rec['id']}: отложенный ордер исполнился — мы в позиции "
                          f"({len(pos)} шт. @ {pos[0].price_open:g})")
     bid, ask = trader.price(rec["symbol"])
     tp1 = min(rec["tps"].items(), key=lambda kv: int(kv[0]))[1]
     buy = rec["side"] == "BUY"
     reached = (bid >= tp1) if buy else (ask <= tp1)
+    if rec.get("be_k"):                       # вошли, когда TP1 уже был пройден — безубыток от нашего первого тейка
+        tp_be = rec["tps"].get(str(rec["be_k"]), tp1)
+        reached_be = (bid >= tp_be) if buy else (ask <= tp_be)
+    else:
+        tp_be, reached_be = tp1, reached
 
-    if (pos and not rec["be_done"] and reached and not rec.get("no_auto_be")
+    if (pos and not rec["be_done"] and reached_be and not rec.get("no_auto_be")
             and CFG["management"].get("auto_be_after_tp1", True)):
         rec["be_done"] = True
         res = trader.move_to_be(rec)
         state.save()
         if res:
-            await notify(f"🔒 Сигнал #{rec['id']}: цена дошла до TP1 {tp1:g} → стоп в безубыток\n"
+            await notify(f"🔒 Сигнал #{rec['id']}: цена дошла до {'TP' + str(rec['be_k']) if rec.get('be_k') else 'TP1'} {tp_be:g} → стоп в безубыток\n"
                          + "\n".join("• " + l for l in res))
 
     if pend and not pos:

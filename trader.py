@@ -211,10 +211,35 @@ class Trader:
         stops_gap = max(int(info.trade_stops_level), 0) * info.point
         min_gap = max(stops_gap, spread * 2, sc.get("min_sl_gap", 0))
         rk = self.cfg.get("risk", {})
-        action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap,
-                                          level=float(rk.get(f"entry_level_{sig.side.lower()}",
-                                                             rk.get("entry_level", 0.5))),
-                                          stop_orders=bool(rk.get("out_of_range_stop", False)))
+        level = float(rk.get(f"entry_level_{sig.side.lower()}", rk.get("entry_level", 0.5)))
+        mode = rk.get("entry_mode", "limit")          # limit — только в диапазоне (лимитка на точку); market — сразу по рынку
+        after = rk.get("after_tp1", "skip")           # TP1 уже пройден: skip | rest (TP2/TP3 по рынку) | rest_limit (+TP1 лимиткой)
+        buy = sig.side == "BUY"
+        s_ = 1 if buy else -1
+        cur = tick.ask if buy else tick.bid
+        tp1 = sig.tps[min(sig.tps)]
+        per_k = {}                                    # номер тейка → (действие, цена); пусто — все позиции одинаково
+        if s_ * (cur - sig.sl) <= 0:
+            return None, f"не вхожу: цена {cur:g} уже за стопом {sig.sl:g}"
+        if s_ * (cur - tp1) >= 0:
+            rest = [k for k in sorted(sig.tps) if k > min(sig.tps) and s_ * (cur - sig.tps[k]) < 0]
+            if after == "skip" or not rest:
+                return None, f"не вхожу: цена {cur:g} уже дошла до TP1 {tp1:g}" + ("" if rest else " и дальних тейков")
+            _, _, e = entry_price(sig, sc.get("entry_tolerance", 0), level)
+            action, price = "market", cur
+            why = f"цена {cur:g} уже прошла TP1 {tp1:g} — открываю позиции на TP{', TP'.join(map(str, rest))} по рынку"
+            for k in sig.tps:
+                if k not in rest:
+                    per_k[k] = ("limit", e) if after == "rest_limit" else ("skip", None)
+            if after == "rest_limit":
+                why += f", TP1 — BUY LIMIT {e:g}" if buy else f", TP1 — SELL LIMIT {e:g}"
+        elif mode == "market":
+            if abs(cur - sig.sl) <= min_gap:
+                return None, f"не вхожу: цена {cur:g} слишком близко к стопу {sig.sl:g}"
+            action, price, why = "market", cur, f"по рынку сразу (режим entry_mode: market), цена {cur:g}"
+        else:
+            action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap,
+                                              level=level, stop_orders=bool(rk.get("out_of_range_stop", False)))
         if action == "skip":
             return None, f"не вхожу: {why}"
 
@@ -225,6 +250,10 @@ class Trader:
         positions = plan_positions(total, list(sig.tps), info.volume_min, info.volume_step)
         if not positions:
             return None, f"лот {total:.3f} меньше минимального {info.volume_min} — пропускаю"
+        if per_k:
+            positions = [(k, v) for k, v in positions if per_k.get(k, ("x",))[0] != "skip"]
+            if not any(per_k.get(k, (action,))[0] == action for k, _ in positions):
+                return None, f"не вхожу: при таком лоте нет позиции на дальние тейки ({why})"
         lot = round(sum(v for _, v in positions), 8)
         sl_dist = abs(price - sig.sl)
         risk = self.money(info, lot, sl_dist)
@@ -241,7 +270,9 @@ class Trader:
                 + (" (уменьшен защитой по вашему решению)" if max_lot is not None else ""))
         plan = {"sid": sid, "sig": sig, "name": name, "info": info, "sc": sc, "action": action, "price": price,
                 "positions": positions, "lot": lot, "table_lot": table_lot, "sl_distance": sl_dist,
-                "risk": risk, "margin": margin, "head": head, "reduced": bool(reduced)}
+                "risk": risk, "margin": margin, "head": head, "reduced": bool(reduced),
+                "per_k": {k: v for k, v in per_k.items() if v[0] != "skip"},
+                "be_k": min(k for k, _ in positions if k not in per_k) if per_k else None}
         return plan, head
 
     def execute(self, plan):
@@ -251,6 +282,7 @@ class Trader:
         buy = sig.side == "BUY"
         out, errs = [], []
         for k, vol in plan["positions"]:
+            action, price = plan.get("per_k", {}).get(k, (plan["action"], plan["price"]))
             req = {
                 "symbol": name,
                 "volume": float(vol),
@@ -285,8 +317,9 @@ class Trader:
             else:
                 errs.append(f"TP{k}: {err}")
         rep = plan["head"]
-        if out and action == "market":
-            rep += "\nИсполнено: " + ", ".join(f"TP{o['k']} {o['volume']:g} @ {o['price']:g}" for o in out)
+        done = [o for o in out if o["kind"] == "market"]
+        if done:
+            rep += "\nИсполнено: " + ", ".join(f"TP{o['k']} {o['volume']:g} @ {o['price']:g}" for o in done)
         if errs:
             rep += "\n⚠️ Ошибки: " + "; ".join(errs)
         return out, rep

@@ -24,6 +24,7 @@ COMMANDS = {
     "Сделка закрылась по стопу 🔴\n-300 points": "closed_report",
     "Фиксирую 1/3 TP ✅\nСтоп в бу пока не переставляю, ожидайте апдейт по позиции\n+367 points": "no_be",
     "Большой стоп, соблюдаем риски": "reduce",
+    "Отодвигаю первый TP на значение 4190": "tp",          # 06.10 #1333
     "Занижаем риск стоп длинный": "reduce",
     "Соблюдайте риски, большой Стоплос": "reduce",
 }
@@ -101,6 +102,30 @@ def test_channel_priority():
     assert plan["action"] == "limit" and plan["price"] == 4398.0, why
 
 
+def test_after_tp1():
+    """06.10 #1332: цена уже за TP1 — TP2/TP3 по рынку, TP1 лимиткой на точку входа."""
+    from fake_mt5 import FakeMT5
+    from trader import Trader
+    cfg = {"magic": 770077, "lot_table": [[200, .01], [900, .05]], "risk": {"after_tp1": "rest_limit"},
+           "symbols": {"GOLD": {"enabled": True, "candidates": ["GOLD"], "entry_tolerance": 2.0, "max_spread": 1.0,
+                                "max_slippage": 0.5, "be_offset": 0.3, "min_sl_gap": 1.0}}}
+    sig = parse_signal("GOLD BUY\n4398-4402\nTP1: 4405\nTP2: 4410\nTP3: 4420\nSL: 4380")
+    f = FakeMT5(1000); f.bid = 4406.0
+    t = Trader(cfg, f)
+    plan, why = t.prepare(1, sig)
+    assert plan and plan["be_k"] == 2, why
+    orders, _ = t.execute(plan)
+    kinds = sorted((o["k"], o["kind"]) for o in orders)
+    assert kinds == [(1, "limit"), (2, "market"), (3, "market")], kinds
+    assert [o.price_open for o in f.orders_get()] == [4400.0]
+    cfg["risk"]["after_tp1"] = "skip"
+    assert Trader(cfg, f).prepare(2, sig)[0] is None
+    f.bid = 4415.0                                     # прошла и TP2 — остаётся только TP3
+    cfg["risk"]["after_tp1"] = "rest"
+    plan, why = Trader(cfg, f).prepare(3, sig)
+    assert [k for k, _ in plan["positions"]] == [3], plan["positions"]
+
+
 def test_guard():
     g = G.settings({})
     base = dict(symbol_key="GOLD", plan_lot=0.03, table_lot=0.05, sl_distance=17, balance=1000,
@@ -119,6 +144,6 @@ def test_guard():
 
 
 if __name__ == "__main__":
-    for f in (test_signals, test_commands, test_entry, test_lots, test_channel_priority, test_guard):
+    for f in (test_signals, test_commands, test_entry, test_lots, test_channel_priority, test_after_tp1, test_guard):
         f()
     print("OK")

@@ -61,6 +61,10 @@ risk:
   # отдельно для покупок и продаж (если не заданы — берётся entry_level); /entry buy 20, /entry sell 80
   # entry_level_buy: 0.5
   # entry_level_sell: 0.5
+  entry_mode: limit              # limit — только в диапазоне (лимитка на точку входа); market — сразу по рынку
+                                 # (на истории 27.05–02.10: limit 50% — $1158, market — $973, лимитка на верхний край — $1020)
+  after_tp1: rest_limit          # цена уже прошла TP1, когда пришёл сигнал: skip — пропуск;
+                                 # rest — позиции на TP2/TP3 по рынку; rest_limit — то же + позиция TP1 лимиткой на точку входа
   out_of_range_stop: false       # цена ушла за диапазон в сторону стопа: false = пропуск; true = STOP-ордер на крае
   pending_expiry_min: 240        # BUY/SELL LIMIT по обычному сигналу ждёт до 4 ч (и снимается при TP1/стопе без нас)
   limit_signal_expiry_min: 10080 # LIMIT-сигнал ждёт, пока канал не отменит или цена не дойдёт до TP1 (максимум 7 дней)

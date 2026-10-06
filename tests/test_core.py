@@ -126,6 +126,50 @@ def test_after_tp1():
     assert [k for k, _ in plan["positions"]] == [3], plan["positions"]
 
 
+def test_entry_modes():
+    """Лесенка (своя точка у каждой позиции), откат (лимитка подтягивается), запасной вход по рынку."""
+    from fake_mt5 import FakeMT5
+    from trader import Trader, pullback_price
+    cfg = {"magic": 770077, "lot_table": [[200, .01], [900, .05]], "risk": {"entry_mode": "ladder"},
+           "symbols": {"GOLD": {"enabled": True, "candidates": ["GOLD"], "entry_tolerance": 2.0, "max_spread": 1.0,
+                                "max_slippage": 0.5, "be_offset": 0.3, "min_sl_gap": 1.0}}}
+    sig = parse_signal("GOLD BUY\n4398-4402\nTP1: 4405\nTP2: 4410\nTP3: 4420\nSL: 4380")
+    f = FakeMT5(1000); f.bid = 4401.0                  # ask 4401.15: в диапазоне, ниже верхнего края
+    t = Trader(cfg, f)
+    plan, why = t.prepare(1, sig)
+    orders, _ = t.execute(plan)
+    kinds = sorted((o["k"], o["kind"], o["price"]) for o in orders)
+    assert kinds == [(1, "market", 4401.15), (2, "limit", 4400.0), (3, "limit", 4398.0)], kinds
+    f.tick(4399.5)                                     # дошли до середины — исполнилась TP2
+    assert len(f.positions_get()) == 2 and len(f.orders_get()) == 1
+    assert pullback_price("BUY", 4405.0, 2, 4398, 4402) == 4402.0      # не выше верхнего края
+    assert pullback_price("BUY", 4401.0, 2, 4398, 4402) == 4399.0
+    assert pullback_price("SELL", 4399.0, 2, 4398, 4402) == 4401.0
+    assert pullback_price("BUY", 4399.0, 2, 4398, 4402) == 4398.0      # не ниже нижнего края
+    cfg["risk"].update(entry_mode="pullback", pullback_usd=2)
+    f = FakeMT5(1000); f.bid = 4400.85                 # ask 4401.0 → BUY LIMIT 4399
+    t = Trader(cfg, f)
+    plan, why = t.prepare(2, sig)
+    assert plan["action"] == "limit" and plan["price"] == 4399.0 and plan["trail"]["ext"] == 4401.0, why
+    orders, _ = t.execute(plan)
+    rec = {"id": 2, "side": "BUY", "symbol_key": "GOLD", "orders": orders}
+    assert t.move_pending(rec, 4400.5) == 3 and all(o.price_open == 4400.5 for o in f.orders_get())
+    assert t.move_pending(rec, 4400.0) == 0            # вниз не двигаем
+    f.bid = 4401.5
+    res, new = t.pending_to_market(rec)                # запасной вход: лимитки → рынок
+    assert not f.orders_get() and len(f.positions_get()) == 3 and all(o["kind"] == "market" for o in new), res
+    # ответ куратора 06.10 на примере #1313 (BUY 4158–4155, TP1 4161)
+    cfg["risk"] = {"entry_mode": "curator", "curator_near_usd": 1.0}
+    s2 = parse_signal("TRADE GOLD BUY 4158-4155\nTP1: 4161\nTP2: 4164\nTP3: 4170\nSL: 4140")
+    for bid, ks in ((4156.0, [1, 2, 3]), (4158.5, [1, 2, 3]), (4152.0, [1, 2, 3]), (4160.0, [2, 3])):
+        f = FakeMT5(1000); f.bid = bid
+        plan, why = Trader(cfg, f).prepare(5, s2)
+        assert plan["action"] == "market" and [k for k, _ in plan["positions"]] == ks and not plan["be_k"], (bid, why)
+    cfg["risk"] = {"entry_level": 0.2, "below_range": "market"}
+    f = FakeMT5(1000); f.bid = 4152.0                  # ниже диапазона: по рынку вместо пропуска
+    assert Trader(cfg, f).prepare(6, s2)[0]["action"] == "market"
+
+
 def test_guard():
     g = G.settings({})
     base = dict(symbol_key="GOLD", plan_lot=0.03, table_lot=0.05, sl_distance=17, balance=1000,
@@ -144,6 +188,6 @@ def test_guard():
 
 
 if __name__ == "__main__":
-    for f in (test_signals, test_commands, test_entry, test_lots, test_channel_priority, test_after_tp1, test_guard):
+    for f in (test_signals, test_commands, test_entry, test_lots, test_channel_priority, test_after_tp1, test_entry_modes, test_guard):
         f()
     print("OK")

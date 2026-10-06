@@ -3,7 +3,6 @@
 Вся работа с MT5 идёт через MT5Link (mt5link.py).
 """
 import math
-import time
 import logging
 
 log = logging.getLogger("trader")
@@ -57,7 +56,7 @@ def entry_price(sig, tol: float, level: float):
 
 
 def decide_entry(sig, bid: float, ask: float, tol: float, min_sl_gap: float, level: float = 0.5,
-                 stop_orders: bool = False):
+                 stop_orders: bool = False, below_market: bool = False):
     """
     Решение о входе. Диапазон из сигнала («4158-4155») — диапазон открытия; входим только внутри него,
     не хуже точки входа E = entry_price(level).
@@ -65,6 +64,8 @@ def decide_entry(sig, bid: float, ask: float, tol: float, min_sl_gap: float, lev
       limit  — цена хуже E (внутри диапазона или за ним в сторону тейков): BUY LIMIT / SELL LIMIT по E;
       stop   — (только если stop_orders) цена за диапазоном в сторону стопа: BUY STOP / SELL STOP
                на ближнем крае — вход, когда цена вернётся в диапазон;
+      market — (если below_market, правило куратора 06.10) цена за диапазоном в сторону стопа —
+               все позиции сразу по рынку (цена лучше диапазона);
       skip   — цена за диапазоном в сторону стопа (по умолчанию), за стопом, уже прошла TP1
                или вплотную к стопу.
     """
@@ -86,10 +87,27 @@ def decide_entry(sig, bid: float, ask: float, tol: float, min_sl_gap: float, lev
     if s * (price - e) > 0:
         kind = "BUY LIMIT" if buy else "SELL LIMIT"
         return "limit", e, f"цена {price:g} хуже точки входа {e:g} (диапазон {rng}) — {kind} {e:g}"
+    if below_market and abs(price - sig.sl) > min_sl_gap:
+        return "market", price, f"цена {price:g} лучше диапазона {rng} — по рынку (куратор: «ниже — можно на все три»)"
     if stop_orders:
         kind = "BUY STOP" if buy else "SELL STOP"
         return "stop", best, f"цена {price:g} за диапазоном {rng} в сторону стопа — {kind} {best:g}"
     return "skip", None, f"цена {price:g} за диапазоном {rng} в сторону стопа — не вхожу"
+
+
+def action_text(action, price, buy):
+    """Короткое описание действия для одной позиции: «по рынку», «BUY LIMIT 4156»…"""
+    if action == "market":
+        return "по рынку"
+    if action in ("limit", "stop"):
+        return f"{'BUY' if buy else 'SELL'} {action.upper()} {price:g}"
+    return "пропуск"
+
+
+def pullback_price(side, ext, x, lo, hi):
+    """Лимитка «на откате»: на $x хуже лучшей цены после сигнала (ext), но внутри диапазона [lo, hi]."""
+    p = ext - x if side == "BUY" else ext + x
+    return round(min(max(p, lo), hi), 2)
 
 
 # ---------------------------------------------------------------- работа с MT5
@@ -219,6 +237,8 @@ class Trader:
         cur = tick.ask if buy else tick.bid
         tp1 = sig.tps[min(sig.tps)]
         per_k = {}                                    # номер тейка → (действие, цена); пусто — все позиции одинаково
+        trail = None                                  # режим pullback: параметры подтягивания лимитки
+        below = rk.get("below_range") or ("stop" if rk.get("out_of_range_stop") else "skip")   # skip | stop | market
         if s_ * (cur - sig.sl) <= 0:
             return None, f"не вхожу: цена {cur:g} уже за стопом {sig.sl:g}"
         if s_ * (cur - tp1) >= 0:
@@ -233,14 +253,70 @@ class Trader:
                     per_k[k] = ("limit", e) if after == "rest_limit" else ("skip", None)
             if after == "rest_limit":
                 why += f", TP1 — BUY LIMIT {e:g}" if buy else f", TP1 — SELL LIMIT {e:g}"
+        elif mode == "ladder" and not sig.is_limit:
+            # лесенка: у каждой позиции своя точка в диапазоне (по умолчанию TP1 — у худшего края,
+            # TP2 — в середине, TP3 — у лучшего края); каждая — по рынку или лимиткой по общему правилу
+            lv = rk.get(f"ladder_levels_{sig.side.lower()}", rk.get("ladder_levels", [1.0, 0.5, 0.0]))
+            acts = {}
+            for i, k in enumerate(sorted(sig.tps)[:3]):
+                acts[k] = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap,
+                                       level=float(lv[min(i, len(lv) - 1)]),
+                                       stop_orders=below == "stop", below_market=below == "market")
+            live = [k for k in sorted(acts) if acts[k][0] != "skip"]
+            if not live:
+                action, price, why = acts[min(acts)]
+            else:
+                action, price = acts[live[0]][:2]
+                per_k = {k: a[:2] for k, a in acts.items()}
+                why = "лесенка: " + "; ".join(f"TP{k} — {action_text(a[0], a[1], buy)}" for k, a in sorted(acts.items()))
+        elif mode == "curator" and not sig.is_limit:
+            # ответ куратора 06.10: цена у диапазона или лучше него — 3 позиции по рынку; хуже диапазона
+            # (дальше curator_near_usd от края) — риск ниже: 2 позиции на TP2/TP3 по рынку, БУ при TP1
+            near = float(rk.get("curator_near_usd", 1.0))
+            lo, hi, _ = entry_price(sig, sc.get("entry_tolerance", 0), 0.0)
+            worst = hi if buy else lo
+            if abs(cur - sig.sl) <= min_gap:
+                action, price, why = "skip", None, f"цена {cur:g} вплотную к стопу {sig.sl:g}"
+            elif s_ * (cur - worst) <= near:
+                action, price = "market", cur
+                why = f"цена {cur:g} у диапазона {lo:g}–{hi:g} или лучше — 3 позиции по рынку (правило куратора)"
+            else:
+                action, price = "market", cur
+                per_k = {min(sig.tps): ("skip", None)}
+                why = (f"цена {cur:g} хуже диапазона {lo:g}–{hi:g} — риск ниже: позиции на TP2/TP3 по рынку, "
+                       f"без TP1, безубыток при TP1 (правило куратора)")
+        elif mode == "pullback" and not sig.is_limit:
+            # ждём отката на $X от лучшей для нас цены после сигнала: лимитка на X хуже текущей цены,
+            # подтягивается за ценой (main.check_signal), но не выходит за диапазон открытия
+            x = float(rk.get("pullback_usd", 2.0))
+            lo, hi, _ = entry_price(sig, sc.get("entry_tolerance", 0), 0.0)
+            best = lo if buy else hi
+            target = pullback_price(sig.side, cur, x, lo, hi)
+            if s_ * (cur - best) < 0:
+                action, price, why = "skip", None, f"цена {cur:g} за диапазоном {lo:g}–{hi:g} в сторону стопа"
+            elif abs(target - sig.sl) <= min_gap:
+                action, price, why = "skip", None, f"точка входа {target:g} вплотную к стопу {sig.sl:g}"
+            else:
+                action, price = "limit", target
+                why = (f"жду отката на ${x:g} от лучшей цены после сигнала (диапазон {lo:g}–{hi:g}) — "
+                       f"{action_text('limit', target, buy)}, подтягиваю за ценой")
+                trail = {"x": x, "lo": lo, "hi": hi, "ext": cur}
         elif mode == "market":
             if abs(cur - sig.sl) <= min_gap:
                 return None, f"не вхожу: цена {cur:g} слишком близко к стопу {sig.sl:g}"
             action, price, why = "market", cur, f"по рынку сразу (режим entry_mode: market), цена {cur:g}"
         else:
             action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap,
-                                              level=level, stop_orders=bool(rk.get("out_of_range_stop", False)))
-            if mode == "split" and action == "limit" and not sig.is_limit:
+                                              level=level, stop_orders=below == "stop", below_market=below == "market")
+            lo_, hi_, _ = entry_price(sig, sc.get("entry_tolerance", 0), 0.0)
+            if (action == "limit" and not sig.is_limit and rk.get("above_range") == "rest"
+                    and s_ * (cur - (hi_ if buy else lo_)) > float(rk.get("curator_near_usd", 1.0))):
+                # куратор 06.10: цена хуже диапазона — 2 позиции на TP2/TP3 по рынку, БУ при TP1 (вместо лимитки)
+                per_k = {min(sig.tps): ("skip", None)}
+                action, price = "market", cur
+                why = (f"цена {cur:g} хуже диапазона {lo_:g}–{hi_:g} — позиции на TP2/TP3 по рынку, без TP1, "
+                       f"безубыток при TP1 (правило куратора)")
+            elif mode == "split" and action == "limit" and not sig.is_limit:
                 # цена хуже точки входа: позиция TP1 — лимиткой на точку, TP2/TP3 — сразу по рынку
                 per_k = {min(sig.tps): ("limit", price)}
                 why += f"; TP2/TP3 — сразу по рынку {cur:g}"
@@ -276,7 +352,7 @@ class Trader:
         plan = {"sid": sid, "sig": sig, "name": name, "info": info, "sc": sc, "action": action, "price": price,
                 "positions": positions, "lot": lot, "table_lot": table_lot, "sl_distance": sl_dist,
                 "risk": risk, "margin": margin, "head": head, "reduced": bool(reduced),
-                "per_k": {k: v for k, v in per_k.items() if v[0] != "skip"},
+                "per_k": {k: v for k, v in per_k.items() if v[0] != "skip"}, "trail": trail,
                 "be_k": (min(k for k, _ in positions if k not in per_k)
                          if per_k and min(sig.tps) not in [k for k, _ in positions if k not in per_k]
                          and s_ * (cur - tp1) >= 0 else None)}
@@ -471,6 +547,43 @@ class Trader:
                     msgs.append(f"лимитка TP{k} {'снята' if ok else 'НЕ снята: ' + err}")
                 left -= v
         return msgs
+
+    def pending_to_market(self, rec):
+        """Снять неисполненные ордера сигнала и открыть те же позиции по рынку. Возвращает (отчёт, новые ордера)."""
+        msgs, new = [], []
+        buy = rec["side"] == "BUY"
+        sc = self.scfg(rec["symbol_key"])
+        for o in self.pending_of(rec):
+            k = self.k_of(rec, o.ticket, o.comment)
+            ok, _, err = self.cancel_order(o)
+            if not ok:
+                msgs.append(f"лимитка #{o.ticket} НЕ снята: {err}")
+                continue
+            info = self.mt5.symbol_info(o.symbol)
+            t = self.mt5.symbol_info_tick(o.symbol)
+            req = {"action": self.mt5.TRADE_ACTION_DEAL, "symbol": o.symbol, "volume": float(o.volume_current),
+                   "type": self.mt5.ORDER_TYPE_BUY if buy else self.mt5.ORDER_TYPE_SELL,
+                   "price": t.ask if buy else t.bid, "sl": o.sl, "tp": o.tp,
+                   "deviation": int(round(sc.get("max_slippage", 0.5) / info.point)), "magic": self.magic,
+                   "comment": o.comment, "type_time": self.mt5.ORDER_TIME_GTC, "type_filling": self._filling(info)}
+            ok, res, err = self._send(req)
+            if ok:
+                px = float(res.price or req["price"])
+                new.append({"ticket": int(res.order), "k": k, "kind": "market", "volume": o.volume_current, "price": px})
+                msgs.append(f"TP{k} {o.volume_current:g} по рынку @ {px:g}")
+            else:
+                msgs.append(f"TP{k}: по рынку НЕ открылась: {err}")
+        return msgs, new
+
+    def move_pending(self, rec, price, step=0.1):
+        """Подтянуть лимитки сигнала к цене price (только в сторону ухудшения цены входа, шагом от step)."""
+        buy = rec["side"] == "BUY"
+        moved = 0
+        for o in self.pending_of(rec):
+            if (buy and price > o.price_open + step) or (not buy and price < o.price_open - step):
+                ok, _, _ = self.modify_order(o, price=price)
+                moved += bool(ok)
+        return moved
 
     def cancel_pending(self, rec):
         msgs = []

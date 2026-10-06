@@ -21,7 +21,7 @@ from telethon import Button, TelegramClient, events
 import guard as G
 from parser import parse_signal, parse_command, looks_like_signal
 from mt5link import MT5Link
-from trader import Trader
+from trader import Trader, pullback_price
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE)
@@ -222,6 +222,8 @@ async def handle_signal(msg, text, sig, late=False):
     rec["reduced"] = bool(plan and plan.get("reduced"))
     if plan and plan.get("be_k"):
         rec["be_k"] = plan["be_k"]     # вошли после TP1: безубыток — когда цена дойдёт до нашего первого тейка
+    if plan and plan.get("trail"):
+        rec["trail"] = plan["trail"]   # режим pullback: лимитка подтягивается за ценой
     reasons = guard_trade(plan, times) if plan else []
     if plan and DRY:
         rec["reason"] = "тестовый режим"
@@ -712,20 +714,61 @@ async def check_signal(rec):
             await notify(f"🔒 Сигнал #{rec['id']}: цена дошла до {'TP' + str(rec['be_k']) if rec.get('be_k') else 'TP1'} {tp_be:g} → стоп в безубыток\n"
                          + "\n".join("• " + l for l in res))
 
+    if pend and pos and reached and not rec.get("be_k"):
+        # часть позиций вошла (лесенка/split), цена дошла до TP1 — остальные ордера больше не нужны
+        res = trader.cancel_pending(rec)
+        state.save()
+        await notify(f"⌛️ Сигнал #{rec['id']}: цена дошла до TP1 {tp1:g} — снимаю неисполненные ордера\n"
+                     + "\n".join("• " + l for l in res))
+
     if pend and not pos:
         exp = rec.get("pending_expiry_min", 20) * 60
+        waited = time.time() - rec.get("pending_since", rec["created"])
         why = None
         if reached:
             why = f"цена дошла до TP1 {tp1:g} без нас"
         elif (bid <= rec["sl"]) if buy else (ask >= rec["sl"]):
             why = f"цена дошла до стопа {rec['sl']:g} без нас"
-        elif time.time() - rec.get("pending_since", rec["created"]) > exp:
+        elif waited > exp:
             why = f"лимитка не исполнилась за {exp // 60:.0f} мин"
+        rk = CFG.get("risk", {})
+        fb = float(rk.get("entry_fallback_min", 0) or 0)
+        if (not why and fb and not rec.get("limit_signal") and not rec.get("fallback_done") and not rec.get("filled")
+                and waited >= fb * 60 and (not rk.get("entry_fallback_in_range") or in_zone(rec, bid, ask))):
+            # запасной вход: лимитка не исполнилась за N мин, а цена ещё не дошла до TP1 — входим по рынку
+            rec["fallback_done"] = True
+            res, new = trader.pending_to_market(rec)
+            rec["orders"] += new
+            state.save()
+            await notify(f"⏩ Сигнал #{rec['id']}: лимитка не исполнилась за {fb:g} мин, TP1 не достигнут — "
+                         f"вхожу по рынку\n" + "\n".join("• " + l for l in res))
+            return
+        if not why and rec.get("trail") and not rec.get("filled"):
+            # режим pullback: цена ушла дальше в нашу сторону — подтягиваем лимитку (откат на $X от лучшей цены)
+            tr = rec["trail"]
+            cur = ask if buy else bid
+            if (cur > tr["ext"]) if buy else (cur < tr["ext"]):
+                tr["ext"] = cur
+                if trader.move_pending(rec, pullback_price(rec["side"], cur, tr["x"], tr["lo"], tr["hi"])):
+                    state.save()
         if why:
             res = trader.cancel_pending(rec)
-            rec["status"] = "closed"
+            if rec.get("filled"):
+                why = why.replace(" без нас", "")   # часть позиций уже отработала — итог посчитает следующая проверка
+            else:
+                rec["status"] = "closed"
             state.save()
             await notify(f"⌛️ Сигнал #{rec['id']}: {why} — снимаю ордера\n" + "\n".join("• " + l for l in res))
+
+
+def in_zone(rec, bid, ask):
+    """Цена внутри диапазона открытия сигнала (одна цена в сигнале — ± entry_tolerance)."""
+    lo, hi = rec["zone"]
+    if hi - lo < 0.005:
+        tol = CFG["symbols"].get(rec["symbol_key"], {}).get("entry_tolerance", 0)
+        lo, hi = lo - tol, hi + tol
+    cur = ask if rec["side"] == "BUY" else bid
+    return lo <= cur <= hi
 
 
 def deal_stats(rec):

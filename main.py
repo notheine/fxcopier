@@ -115,10 +115,13 @@ def rules_text():
     if mg.get("auto_be_after_tp1", True):
         L.append(f"• Цена дошла до TP1 → стоп остальных позиций в безубыток (+${gold.get('be_offset', 0):g})")
     sl_rule = rk.get("sl_rule", "none") or "none"
-    L.append("• Стоп и тейки — как в сигнале канала" if sl_rule == "none" else f"• Стоп относительно тейков: {sl_rule}")
-    lot = (f"фиксированный {CFG['fixed_total_lot']:g}" if CFG.get("fixed_total_lot") else "по таблице куратора")
-    L.append(f"• Лот {lot}" + ("; «занижаем риск» / RISKY → лот ÷2" if CFG.get("halve_on_risky", True) else ""))
-    L.append(f"• Не больше {rk.get('max_active_signals', 2)} сигналов одновременно")
+    if sl_rule != "none":                                  # стоп/тейки и лот по таблице — само собой, не пишем
+        L.append(f"• Стоп относительно тейков: {sl_rule}")
+    if CFG.get("fixed_total_lot"):
+        L.append(f"• Лот фиксированный {CFG['fixed_total_lot']:g}")
+    elif not CFG.get("halve_on_risky", True):
+        L.append("• «Занижаем риск» / RISKY — лот НЕ уменьшаю")
+    L.append(f"• Не больше {rk.get('max_active_signals', 2)} сигналов одновременно (куратор)")
     L.append(f"• Сигнал старше {rk.get('max_signal_age_sec', 120) // 60:g} мин → не вхожу")
     if float(rk.get("max_daily_loss_pct", 0) or 0) > 0:
         L.append(f"• Убыток за день больше {rk['max_daily_loss_pct']:g}% → новых входов до завтра нет")

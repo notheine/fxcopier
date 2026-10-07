@@ -22,6 +22,7 @@ import guard as G
 from parser import parse_signal, parse_command, looks_like_signal
 from mt5link import MT5Link
 from trader import Trader, pullback_price
+from trend import TrendBot
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE)
@@ -136,6 +137,8 @@ def rules_text():
         L.append("• Пятница вечером → закрываю всё на выходные")
     if CFG.get("guard", {}).get("enabled", True):
         L.append("• Защита: опасная сделка → пауза и кнопки в группе")
+    if TR and TR.rules_line():
+        L.append(TR.rules_line())
     if state.d.get("paused"):
         L.append("⏸ Сейчас пауза: новые сигналы пропускаю (/resume)")
     return "\n".join(L)
@@ -143,6 +146,7 @@ def rules_text():
 
 link = None
 trader = None
+TR = None            # тренд-робот (trend.py)
 client = TelegramClient(os.path.join(BASE, "session"), int(CFG["telegram"]["api_id"]),
                         CFG["telegram"]["api_hash"], catch_up=True)
 NOTIFY = CFG["telegram"].get("notify_chat", "me")
@@ -959,6 +963,10 @@ def build_report(kind):
         if pos or orders:
             lines.append(f"Открыто сейчас: позиций {len(pos)}, лимиток {len(orders)}, "
                          f"плавающий P/L {sum(p.profit for p in pos):+.2f}")
+    if TR:
+        tl = TR.report_line(t0, t1)
+        if tl:
+            lines += ["", tl]
     return "\n".join(lines)
 
 
@@ -994,7 +1002,8 @@ async def scheduled_reports():
 HELP = ("Команды (пишите сюда):\n/status — счёт и открытые сделки\n"
         "/entry — точка входа в диапазоне сигнала (/entry buy 20, /entry sell 80, /entry 50 — обе)\n/report — отчёт за день (/report week, /report month)\n/pause — не входить в новые сигналы\n"
         "/resume — снова входить\n/closeall — закрыть ВСЕ сделки копировщика и снять лимитки\n"
-        "/approve, /approve_safe, /reject — решение по сделке, остановленной защитой (если нет кнопок)\n/help — эта справка")
+        "/approve, /approve_safe, /reject — решение по сделке, остановленной защитой (если нет кнопок)\n"
+        "/trend — тренд-робот (/trend sell, /trend buy, /trend stop, /trend off, /trend on)\n/help — эта справка")
 
 
 async def handle_user_command(cmd, arg=""):
@@ -1009,6 +1018,12 @@ async def handle_user_command(cmd, arg=""):
             await resolve_hold("resume")
         elif h["type"] == "trade":
             await resolve_hold("no")
+    if cmd == "trend":
+        if TR is None:
+            await notify("Тренд-робот ещё не запущен.")
+        else:
+            await TR.command(arg)
+        return
     if cmd == "report":
         kind = {"week": "week", "неделя": "week", "month": "month", "месяц": "month"}.get(arg.strip().lower(), "day")
         await notify(build_report(kind))
@@ -1055,6 +1070,8 @@ async def handle_user_command(cmd, arg=""):
             lines.append(f"• отложенный ордер {o.symbol} {o.volume_current:g} @ {o.price_open:g}")
         if not pos and not orders:
             lines.append("открытых сделок нет")
+        if TR:
+            lines += ["", TR.status_text()]
         await notify("\n".join(lines))
     elif cmd == "pause":
         state.d["paused"] = True
@@ -1077,10 +1094,31 @@ async def handle_user_command(cmd, arg=""):
         for o in orders:
             ok, _, err = trader.cancel_order(o)
             lines.append(f"лимитка #{o.ticket} {'снята' if ok else 'ошибка ' + err}")
+        if TR and TR.s["series"]:
+            lines += TR.close_all()
+            await TR._finish(TR.s["series"], "закрыл по /closeall")
         state.save()
         await notify("🧹 Закрыл всё:\n" + ("\n".join("• " + l for l in lines) if lines else "нечего закрывать"))
     else:
         await notify(HELP)
+
+
+# ------------------------------------------------------------------ тренд-робот
+
+def trend_buttons(aid, d):
+    return [[Button.inline("📉 Продать" if d < 0 else "📈 Купить", f"t:go:{aid}".encode()),
+             Button.inline("Пропустить", f"t:no:{aid}".encode())]]
+
+
+async def trend_loop():
+    while True:
+        await asyncio.sleep(CFG.get("trend", {}).get("interval_sec", 2))
+        if TR is None or not mt5_ok:
+            continue
+        try:
+            await TR.tick()
+        except Exception:
+            log.exception("ошибка тренд-робота")
 
 
 # ------------------------------------------------------------------ запуск
@@ -1180,7 +1218,7 @@ async def wait_for_channel():
 
 
 async def main():
-    global link, trader, channel_entity, mt5_ok
+    global link, trader, channel_entity, mt5_ok, TR
     global notify_peer
     await client.start()
 
@@ -1219,6 +1257,26 @@ async def main():
                 await event.edit(buttons=None)
             except Exception:
                 pass
+
+        @bot.on(events.CallbackQuery(pattern=rb"^t:"))
+        async def on_trend_button(event):
+            if OWNER_IDS and event.sender_id not in OWNER_IDS:
+                await event.answer("Кнопки только для владельца", alert=True)
+                return
+            if TR is None:
+                await event.answer("Копировщик ещё запускается")
+                return
+            _, action, aid = event.data.decode().split(":", 2)
+            try:
+                ans = await TR.on_button(action, aid)
+            except Exception as e:
+                log.exception("ошибка кнопки тренда")
+                ans = f"Ошибка: {e}"
+            await event.answer(ans[:190])
+            try:
+                await event.edit(buttons=None)
+            except Exception:
+                pass
     else:
         try:
             notify_peer = await client.get_input_entity(NOTIFY)
@@ -1235,6 +1293,7 @@ async def main():
     trader = Trader(CFG, link)
     acc, is_demo = trader.connect()
     mt5_ok = True
+    TR = TrendBot(CFG, trader, notify, now_msk, make_buttons=trend_buttons)
     warn = "" if trader.trade_allowed() else "\n⚠️ В терминале выключена алготорговля (Algo Trading) — ордера не пройдут!"
     await notify(f"🚀 Копировщик запущен\n\n"
                  f"Режим: {MODE}{' (только разбор, без ордеров)' if DRY else ''}\n"
@@ -1258,6 +1317,7 @@ async def main():
 
     asyncio.create_task(monitor())
     asyncio.create_task(poll_channel())
+    asyncio.create_task(trend_loop())
     await client.run_until_disconnected()
 
 

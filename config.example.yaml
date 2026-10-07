@@ -165,3 +165,32 @@ guard:
   max_losses_in_row: 3          # 3 убытка подряд → пауза и вопрос
   max_drawdown_pct: 25          # эквити ниже пика баланса на 25% → пауза и вопрос
   approval_ttl_min: 15          # разрешение на сделку действует 15 минут
+
+# Тренд-робот (trend.py, 08.10.2026): уведомление об очевидном тренде + «лесенка» по кнопке. Только демо.
+# Все ключи необязательны — ниже значения по умолчанию.
+trend:
+  enabled: true
+  allow_live: false             # на реальном счёте не работает, пока не true
+  magic: 770078
+  notify: true                  # уведомления (в группе: /trend off, /trend on)
+  window_bars: 48               # «сутки» свечей M30
+  min_bars: 6                   # ход ≥ 3 ч
+  max_bounce: 0.30              # отскоки ≤ 30% хода
+  max_candle: 0.40              # одна свеча ≤ 40% хода
+  min_move_atr: 5.0             # ход ≥ 5 ATR(M30)
+  min_move_usd: 15.0
+  realert_min: 240              # в ту же сторону не чаще раза в 4 ч
+  alert_ttl_min: 15             # кнопка действует 15 мин
+  risk_pct: 1.0                 # риск серии — 1% баланса
+  min_stop_usd: 5.0             # стоп не ближе $5
+  max_stop_atr: 2.0             # и не дальше 2 ATR
+  swing_bars: 3                 # стоп за крайней ценой последних 3 свечей M30
+  stop_buffer_usd: 0.5
+  add_step_r: 1.0               # доливка через каждый R
+  trail_r: 2.0                  # общий стоп на 2R за лучшей ценой
+  max_positions: 4
+  be_offset_usd: 0.3
+  max_losses_day: 2
+  no_entry: ["15:00-16:00"]     # МСК, данные США
+  no_entry_friday_after: "21:00"
+  friday_close: "23:30"

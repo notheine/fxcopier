@@ -31,7 +31,7 @@ ssh -t root@<IP> fxctl bot <username>  # бот + группа для отчёт
 ssh root@<IP> fxctl mode demo        # торговля на демо
 ```
 
-Команды в группе: `/status` `/entry` `/report` `/report week` `/report month` `/pause` `/resume` `/closeall` `/help`
+Команды в группе: `/status` `/entry` `/report` `/report week` `/report month` `/pause` `/resume` `/closeall` `/trend` `/help`
 (`/entry 50`, `/entry buy 20`, `/entry sell 80` — точка входа в диапазоне сигнала: 0 — лучший край, 100 — худший)
 
 ## Безопасность
@@ -45,4 +45,5 @@ ssh root@<IP> fxctl mode demo        # торговля на демо
 
 ```bash
 python tests/test_core.py
+python tests/test_trend.py
 ```

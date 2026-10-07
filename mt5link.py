@@ -104,3 +104,19 @@ class MT5Link:
         if r is None or len(r) == 0:
             return None
         return float(max(r["high"])), float(min(r["low"]))
+
+    def rates(self, symbol: str, tf: str = "M30", count: int = 200, start: int = 1):
+        """Закрытые свечи (start=1 — без текущей): список (время сервера, open, high, low, close), старые первыми."""
+        if self.remote:   # одной строкой — так в разы быстрее, чем поэлементно через мост
+            s = str(self.conn.eval(
+                f"(lambda r: '' if r is None else ';'.join('%d,%r,%r,%r,%r' % (x['time'], float(x['open']), "
+                f"float(x['high']), float(x['low']), float(x['close'])) for x in r))"
+                f"(mt5.copy_rates_from_pos({symbol!r}, mt5.TIMEFRAME_{tf}, {int(start)}, {int(count)}))"))
+            out = []
+            for row in s.split(";") if s else []:
+                t, o, h, lo, c = row.split(",")
+                out.append((int(t), float(o), float(h), float(lo), float(c)))
+            return out
+        r = self.m.copy_rates_from_pos(symbol, getattr(self.m, f"TIMEFRAME_{tf}"), int(start), int(count))
+        return [] if r is None else [(int(x["time"]), float(x["open"]), float(x["high"]), float(x["low"]),
+                                      float(x["close"])) for x in r]

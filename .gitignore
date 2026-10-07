@@ -4,6 +4,8 @@ config.yaml
 *.session-journal
 state*.json
 journal.jsonl
+trend_state.json
+trend_journal.jsonl
 test_state.json
 mt5_path.txt
 logs/

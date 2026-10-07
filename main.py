@@ -160,10 +160,19 @@ channel_entity = None
 mt5_ok = False
 
 
-async def notify(text: str, buttons=None, alt=""):
-    """Отчёт в группу (от бота). buttons — кнопки; alt — текстовая подсказка, если бота нет."""
-    log.info("NOTIFY: %s", text.replace("\n", " | "))
+async def notify(text: str, buttons=None, alt="", image=None):
+    """Отчёт в группу (от бота). buttons — кнопки; alt — текстовая подсказка, если бота нет; image — PNG (bytes)."""
+    log.info("NOTIFY: %s%s", text.replace("\n", " | "), " [+график]" if image else "")
     try:
+        if image:
+            import io
+            f = io.BytesIO(image)
+            f.name = "chart.png"
+            if bot:
+                await bot.send_file(REPORT_CHAT, f, caption=text[:1024], buttons=buttons)
+            else:
+                await client.send_file(notify_peer or NOTIFY, f, caption=(text + ("\n\n" + alt if alt else ""))[:1024])
+            return
         if bot:
             await bot.send_message(REPORT_CHAT, text[:4000], buttons=buttons)
         elif buttons and alt:
@@ -1003,7 +1012,7 @@ HELP = ("Команды (пишите сюда):\n/status — счёт и отк
         "/entry — точка входа в диапазоне сигнала (/entry buy 20, /entry sell 80, /entry 50 — обе)\n/report — отчёт за день (/report week, /report month)\n/pause — не входить в новые сигналы\n"
         "/resume — снова входить\n/closeall — закрыть ВСЕ сделки копировщика и снять лимитки\n"
         "/approve, /approve_safe, /reject — решение по сделке, остановленной защитой (если нет кнопок)\n"
-        "/trend — тренд-робот (/trend sell, /trend buy, /trend stop, /trend off, /trend on)\n/help — эта справка")
+        "/trend — тренд-робот (/trend chart, /trend sell, /trend buy, /trend stop, /trend off, /trend on)\n/help — эта справка")
 
 
 async def handle_user_command(cmd, arg=""):

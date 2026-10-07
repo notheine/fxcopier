@@ -59,13 +59,16 @@ def make(now_h=12, weekday=2, bars=None):
     cfg = {"mode": "demo", "magic": 770077, "symbols": {"GOLD": {"candidates": ["GOLD"]}}, "trend": {}}
     tr = Trader(cfg, f)
     msgs = []
+    imgs = []
 
-    async def notify(text, buttons=None, alt=""):
+    async def notify(text, buttons=None, alt="", image=None):
         msgs.append((text, buttons))
+        imgs.append(image)
     base = dt.datetime(2026, 10, 5 + weekday, now_h, 5)      # 05.10.2026 — понедельник
     d = tempfile.mkdtemp()
     tb = TRD.TrendBot(cfg, tr, notify, lambda: base, make_buttons=lambda aid, dd: [("go", aid, dd)],
                       state_path=os.path.join(d, "s.json"), journal=os.path.join(d, "j.jsonl"))
+    tb.imgs = imgs
     return f, tb, msgs
 
 
@@ -138,11 +141,16 @@ def test_alert_button():
     run = asyncio.run
     run(tb.scan())
     assert msgs and "уверенно падает" in msgs[0][0] and msgs[0][1] == [("go", 1, -1)], msgs
+    import importlib.util
+    if importlib.util.find_spec("matplotlib"):
+        assert tb.imgs[0] and tb.imgs[0][:4] == b"\x89PNG", "к уведомлению нет картинки"
     aid = tb.s["alert"]["id"]
     run(tb.scan())                                       # та же свеча — повторно не шлём
     assert len(msgs) == 1
     assert run(tb.on_button("go", "999")) == "Уже неактуально"
     assert run(tb.on_button("go", str(aid))) == "Открываю" and tb.s["series"]
+    run(tb.command("chart"))
+    assert "График" in msgs[-1][0]
     # кнопка «пропустить» и устаревание
     f, tb, msgs = make()
     run(tb.scan())

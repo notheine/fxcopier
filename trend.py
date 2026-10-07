@@ -27,6 +27,7 @@
 На истории (docs/RESEARCH.md, разделы 1 и 3): сама «лесенка» по сигналу «3 свечи подряд» — на уровне
 случайных входов; детектор «сильнейший ход за сутки без отскоков» — слабый плюс. Это эксперимент на демо.
 """
+import asyncio
 import json
 import logging
 import math
@@ -236,6 +237,52 @@ class TrendBot:
         return {"d": d, "entry": entry, "R": R, "lot": lot, "risk": round(self.tr.money(info, lot, R), 2),
                 "sl": round(entry - d * R, 2), "note": note, "bal": bal}, ""
 
+    # ---- картинка графика
+    async def picture(self, bars=None, sig=None, plan=None, ser=None, deals=None, title=""):
+        """PNG графика (свечи за ~2.5 суток + текущая) или None, если нарисовать не вышло."""
+        try:
+            import chart
+            bars = list(bars or self.bars(150))
+            cur = self.mt5.rates(self.sym(), "M30", 1, 0)
+            if cur and (not bars or cur[-1][0] > bars[-1][0]):
+                bars.append(cur[-1])
+            tick = self.mt5.symbol_info_tick(self.sym())
+            levels = []
+            if plan:
+                levels += [(plan["entry"], "вход", "#1e88e5", "-"), (plan["sl"], "стоп", "#e53935", "--"),
+                           (round(plan["entry"] + plan["d"] * self.p["add_step_r"] * plan["R"], 2), "доливка",
+                            "#9e9e9e", ":")]
+            if ser:
+                pos = self.positions()
+                if pos:
+                    sl = min(p.sl for p in pos) if ser["d"] > 0 else max(p.sl for p in pos)
+                    levels.append((sl, "стоп", "#e53935", "--"))
+                if ser.get("adds_ok") and ser["n"] < self.p["max_positions"]:
+                    levels.append((ser["next_add"], "доливка", "#9e9e9e", ":"))
+                deals = (deals or []) + [(int(getattr(p, "time", 0) or 0), p.price_open,
+                                          "buy" if ser["d"] > 0 else "sell") for p in pos if getattr(p, "time", 0)]
+            leg = (sig["start_t"], sig["start_px"], sig["t"], sig["price"]) if sig else None
+            return await asyncio.to_thread(chart.render, bars, title=title, leg=leg, levels=levels,
+                                           deals=deals, price=tick.bid)
+        except Exception as e:
+            log.warning("тренд: картинка не получилась: %s", e)
+            return None
+
+    def series_deals(self, ser):
+        """Сделки серии из истории MT5: [(время, цена, buy|sell|exit)]."""
+        try:
+            ids = set(ser["tickets"])
+            out = []
+            for x in self.mt5.history_deals_get(ser["opened"] - 86400, time.time() + 86400):
+                if int(x.position_id) not in ids or not getattr(x, "time", 0) or not getattr(x, "price", 0):
+                    continue
+                kind = "exit" if int(getattr(x, "entry", 0)) == 1 else ("buy" if ser["d"] > 0 else "sell")
+                out.append((int(x.time), float(x.price), kind))
+            return out
+        except Exception as e:
+            log.warning("тренд: сделки серии не получены: %s", e)
+            return []
+
     # ---- уведомления
     async def scan(self):
         last = self.mt5.rates(self.sym(), "M30", 1, 1)       # дёшево: только время последней закрытой свечи
@@ -282,7 +329,10 @@ class TrendBot:
                     f"Кнопка действует {self.p['alert_ttl_min']} мин")
             if why:
                 txt += f"\n⚠️ {why}"
-            await self.notify(txt, buttons=self.make_buttons(aid, sig["d"]))
+            img = await self.picture(bars, sig, plan, title=(
+                f"{'Падение' if down else 'Рост'}: {sig['start_px']:.0f} → {sig['price']:.0f} за {sig['hours']:.0f} ч, "
+                f"отскоки до ${sig['bounce']:.0f}"))
+            await self.notify(txt, buttons=self.make_buttons(aid, sig["d"]), image=img)
         else:
             await self.notify(txt + f"Не предлагаю: {err}")
 
@@ -345,11 +395,12 @@ class TrendBot:
                             "adds_ok": True, "n": 1, "n_open": 1, "tickets": [ticket], "src": src}
         self.save()
         word = "Продал" if d < 0 else "Купил"
+        img = await self.picture(ser=self.s["series"], title=f"Тренд-серия #{sid}: {word.lower()} {plan['lot']:g} по {fill:.2f}")
         await self.notify(f"{'📉' if d < 0 else '📈'} Тренд-серия #{sid} ({src})\n\n"
                           f"{word} {plan['lot']:g} по {fill:.2f}\n"
                           f"Стоп {fill - d * plan['R']:.2f} (${plan['R']:g}), риск ${plan['risk']:.0f}{plan['note']}\n\n"
                           f"Доливка при {self.s['series']['next_add']:.2f}, всего до {self.p['max_positions']} позиций\n"
-                          f"Тейков нет, стоп тянется за ценой на ${self.p['trail_r'] * plan['R']:g}")
+                          f"Тейков нет, стоп тянется за ценой на ${self.p['trail_r'] * plan['R']:g}", image=img)
         return "Открываю"
 
     def positions(self):
@@ -397,8 +448,9 @@ class TrendBot:
             self.s["losses"] = {day: self.s["losses"].get(day, 0) + 1}
         self.s["series"] = None
         self.save()
+        img = await self.picture(deals=self.series_deals(ser), title=f"Тренд-серия #{ser['id']}: итог {pnl:+.2f} $")
         await self.notify(f"🏁 Тренд-серия #{ser['id']} закрыта ({why})\n\n"
-                          f"Позиций было: {ser['n']}\nИтог: {pnl:+.2f} $")
+                          f"Позиций было: {ser['n']}\nИтог: {pnl:+.2f} $", image=img)
 
     async def manage(self):
         ser = self.s["series"]
@@ -514,6 +566,13 @@ class TrendBot:
             if ser:
                 await self._finish(ser, "закрыл по команде")
             await self.notify("Тренд: " + ("\n".join(lines) if lines else "открытых позиций нет"))
+        elif a in ("chart", "график", "картинка"):
+            bars = self.bars(150)
+            sig = detect(bars, self.p) if bars else None
+            ser = self.s["series"]
+            title = "Сейчас" + (" — идёт тренд-серия" if ser else (" — очевидный тренд" if sig else ""))
+            img = await self.picture(bars, sig=sig, ser=ser, title=title)
+            await self.notify("📊 График золота за ~2.5 суток" if img else "Не получилось нарисовать график", image=img)
         elif a in ("off", "выкл"):
             self.s["muted"] = True
             self.save()
@@ -524,6 +583,7 @@ class TrendBot:
             await self.notify("🔔 Тренд: уведомления включены")
         else:
             await self.notify(self.status_text() + "\n\n"
+                              "/trend chart — график сейчас\n"
                               "/trend sell, /trend buy — начать серию сейчас\n"
                               "/trend stop — закрыть серию\n"
                               "/trend off, /trend on — уведомления")

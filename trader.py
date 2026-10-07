@@ -335,6 +335,32 @@ class Trader:
             positions = [(k, v) for k, v in positions if per_k.get(k, ("x",))[0] != "skip"]
             if not any(per_k.get(k, (action,))[0] == action for k, _ in positions):
                 return None, f"не вхожу: при таком лоте нет позиции на дальние тейки ({why})"
+        # стоп относительно тейков (sl_rule; по умолчанию none — стоп как в сигнале)
+        rule = rk.get("sl_rule", "none") or "none"
+        sl_k = {}
+        if rule != "none":
+            ent = {k: per_k.get(k, (action, price))[1] for k, _ in positions}
+            ks = sorted(sig.tps)
+            tp_ref = {"tp1": sig.tps[ks[0]], "tp2": sig.tps[ks[min(1, len(ks) - 1)]], "tp3": sig.tps[ks[-1]]}
+            if rule.startswith("skip_"):
+                if rule == "skip_total":
+                    bad = sum(abs(ent[k] - sig.sl) for k in ent) > sum(abs(sig.tps[k] - ent[k]) for k in ent)
+                    what = "суммарный убыток по стопу больше суммарной прибыли по тейкам"
+                else:
+                    ref = tp_ref[rule[5:]]
+                    bad = abs(price - sig.sl) > abs(ref - price)
+                    what = f"стоп {sig.sl:g} дальше {rule[5:].upper()} {ref:g}"
+                if bad:
+                    return None, f"не вхожу: {what} (правило sl_rule: {rule})"
+            elif rule.startswith("cap_"):
+                mult = float(rk.get("sl_cap_mult", 1.0))
+                for k, e_ in ent.items():
+                    tgt = sig.tps[k] if rule == "cap_each" else tp_ref[rule[4:]]
+                    lim = max(abs(tgt - e_) * mult, min_gap)
+                    if abs(e_ - sig.sl) > lim:
+                        sl_k[k] = round(e_ - lim if buy else e_ + lim, 2)
+                if sl_k:
+                    why += "; стоп ближе (не дальше тейка): " + ", ".join(f"TP{k} — {v:g}" for k, v in sorted(sl_k.items()))
         lot = round(sum(v for _, v in positions), 8)
         sl_dist = abs(price - sig.sl)
         risk = self.money(info, lot, sl_dist)
@@ -352,10 +378,11 @@ class Trader:
         plan = {"sid": sid, "sig": sig, "name": name, "info": info, "sc": sc, "action": action, "price": price,
                 "positions": positions, "lot": lot, "table_lot": table_lot, "sl_distance": sl_dist,
                 "risk": risk, "margin": margin, "head": head, "reduced": bool(reduced),
-                "per_k": {k: v for k, v in per_k.items() if v[0] != "skip"}, "trail": trail,
-                "be_k": (min(k for k, _ in positions if k not in per_k)
-                         if per_k and min(sig.tps) not in [k for k, _ in positions if k not in per_k]
-                         and s_ * (cur - tp1) >= 0 else None)}
+                "per_k": {k: v for k, v in per_k.items() if v[0] != "skip"}, "trail": trail, "sl_k": sl_k,
+                # вошли, когда TP1 уже пройден: безубыток — у первого ещё не достигнутого тейка канала
+                # (обычно TP2), даже если позиции на нём нет (при половинном лоте — только TP1 и TP3)
+                "be_k": (min([k for k in sig.tps if s_ * (cur - sig.tps[k]) < 0], default=None)
+                         if s_ * (cur - tp1) >= 0 else None)}
         return plan, head
 
     def execute(self, plan):
@@ -369,7 +396,7 @@ class Trader:
             req = {
                 "symbol": name,
                 "volume": float(vol),
-                "sl": self._norm(info, sig.sl),
+                "sl": self._norm(info, plan.get("sl_k", {}).get(k, sig.sl)),
                 "tp": self._norm(info, sig.tps[k]),
                 "magic": self.magic,
                 "comment": f"WW{sid}-{k}",

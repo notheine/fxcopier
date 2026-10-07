@@ -118,6 +118,9 @@ def test_after_tp1():
     kinds = sorted((o["k"], o["kind"]) for o in orders)
     assert kinds == [(1, "limit"), (2, "market"), (3, "market")], kinds
     assert [o.price_open for o in f.orders_get()] == [4400.0]
+    lot_cfg = {**cfg, "fixed_total_lot": 0.025}        # половинный лот: позиции TP1 (лимитка) и TP3, БУ — у TP2
+    plan, why = Trader(lot_cfg, f).prepare(4, sig)
+    assert [k for k, _ in plan["positions"]] == [1, 3] and plan["be_k"] == 2, (plan["positions"], plan["be_k"])
     cfg["risk"]["after_tp1"] = "skip"
     assert Trader(cfg, f).prepare(2, sig)[0] is None
     f.bid = 4415.0                                     # прошла и TP2 — остаётся только TP3
@@ -165,6 +168,13 @@ def test_entry_modes():
         f = FakeMT5(1000); f.bid = bid
         plan, why = Trader(cfg, f).prepare(5, s2)
         assert plan["action"] == "market" and [k for k, _ in plan["positions"]] == ks and not plan["be_k"], (bid, why)
+    cfg["risk"] = {"entry_level": 0.2, "below_range": "market"}
+    cfg["risk"] = {"entry_level": 0.2, "sl_rule": "cap_tp1"}   # стоп не дальше TP1 (по умолчанию выключено)
+    f = FakeMT5(1000); f.bid = 4155.5
+    plan, why = Trader(cfg, f).prepare(9, s2)
+    assert plan["sl_k"] == {1: 4150.2, 2: 4150.2, 3: 4150.2}, plan["sl_k"]   # лимитка 4155.6, TP1 4161
+    cfg["risk"]["sl_rule"] = "skip_tp1"
+    assert Trader(cfg, f).prepare(10, s2)[0] is None
     cfg["risk"] = {"entry_level": 0.2, "below_range": "market"}
     f = FakeMT5(1000); f.bid = 4152.0                  # ниже диапазона: по рынку вместо пропуска
     assert Trader(cfg, f).prepare(6, s2)[0]["action"] == "market"

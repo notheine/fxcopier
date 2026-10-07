@@ -99,6 +99,10 @@ def rules_text():
         L.append("   (0% — лучший край диапазона, 100% — худший)")
         if mode != "limit":
             L.append(f"• Режим входа: {mode}")
+        for side, name in (("buy", "покупки"), ("sell", "продажи")):
+            ch = rk.get(f"chase_usd_{side}")
+            if ch is not None:
+                L.append(f"• {name.capitalize()}: цена в диапазоне или до ${float(ch):g} хуже края → все три по рынку (куратор)")
         L.append(f"• Цена хуже точки входа → лимитка на точку, ждёт до {rk.get('pending_expiry_min', 240) // 60:g} ч")
         if float(rk.get("entry_fallback_min", 0) or 0):
             L.append(f"• Лимитка не исполнилась за {rk['entry_fallback_min']:g} мин → вход по рынку")

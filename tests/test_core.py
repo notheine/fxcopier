@@ -184,6 +184,23 @@ def test_entry_modes():
     assert plan["action"] == "market" and len(plan["positions"]) == 3, why
     f.bid = 4169.5                                     # вплотную к стопу — не входим
     assert Trader(cfg, f).prepare(8, s3)[0] is None
+    # правило куратора №4 (chase_usd_*): #1338 SELL 4113–4119, цена 4112.86 — на $0.14 хуже края
+    s4 = parse_signal("TRADE GOLD SELL\n4113-4119\nTP1: 4109\nTP2: 4104\nTP3: 4098\nSL: 4124")
+    cfg["risk"] = {"entry_level_sell": 0.8, "below_range": "market"}
+    f = FakeMT5(1000); f.bid = 4112.86
+    plan, why = Trader(cfg, f).prepare(11, s4)
+    assert plan["action"] == "limit" and plan["price"] == 4114.2, why          # по умолчанию — лимитка
+    cfg["risk"]["chase_usd_sell"] = 2.0
+    plan, why = Trader(cfg, f).prepare(12, s4)
+    assert plan["action"] == "market" and len(plan["positions"]) == 3, why     # куратор: до $2 — по рынку
+    f.bid = 4110.5                                     # $2.5 за краем — снова лимитка
+    assert Trader(cfg, f).prepare(13, s4)[0]["action"] == "limit"
+    cfg["risk"]["chase_usd_buy"] = 2.0                 # одна цена «4020»: вход до 4022 (пример куратора)
+    s5 = parse_signal("GOLD BUY\n4020\nTP1: 4026\nTP2: 4030\nTP3: 4036\nSL: 4010")
+    f = FakeMT5(1000); f.bid = 4021.7                  # ask 4021.85
+    assert Trader(cfg, f).prepare(14, s5)[0]["action"] == "market"
+    f.bid = 4022.0                                     # ask 4022.15 > 4022 — лимитка
+    assert Trader(cfg, f).prepare(15, s5)[0]["action"] == "limit"
 
 
 def test_guard():

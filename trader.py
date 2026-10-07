@@ -309,7 +309,16 @@ class Trader:
             action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap,
                                               level=level, stop_orders=below == "stop", below_market=below == "market")
             lo_, hi_, _ = entry_price(sig, sc.get("entry_tolerance", 0), 0.0)
-            if (action == "limit" and not sig.is_limit and rk.get("above_range") == "rest"
+            chase = rk.get(f"chase_usd_{sig.side.lower()}")
+            edge = sig.zone[1] if buy else sig.zone[0]        # худший край диапазона из сигнала (без допуска)
+            if (action == "limit" and not sig.is_limit and chase is not None
+                    and s_ * (cur - edge) <= float(chase)):
+                # правило куратора №4: «входить только на точке входа, допустимо до +$2»
+                # (4020 → вход до 4022): цена в диапазоне или не дальше $chase за худшим краем — все позиции по рынку
+                action, price = "market", cur
+                why = (f"цена {cur:g} в диапазоне {sig.zone[0]:g}–{sig.zone[1]:g} или не дальше ${float(chase):g} "
+                       f"за краем — все позиции по рынку (куратор: вход до +${float(chase):g})")
+            elif (action == "limit" and not sig.is_limit and rk.get("above_range") == "rest"
                     and s_ * (cur - (hi_ if buy else lo_)) > float(rk.get("curator_near_usd", 1.0))):
                 # куратор 06.10: цена хуже диапазона — 2 позиции на TP2/TP3 по рынку, БУ при TP1 (вместо лимитки)
                 per_k = {min(sig.tps): ("skip", None)}

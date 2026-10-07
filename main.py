@@ -784,6 +784,14 @@ async def check_signal(rec):
         reached_be = (bid >= tp_be) if buy else (ask <= tp_be)
     else:
         tp_be, reached_be = tp1, reached
+        mg = CFG.get("management", {})
+        near, frac = float(mg.get("be_near_tp1_usd", 0) or 0), float(mg.get("be_at_frac", 0) or 0)
+        if pos and not reached_be and (near or frac):
+            # ранний безубыток: цена почти дошла до TP1 (за near $ или прошла долю frac пути от входа)
+            e = sum(p.price_open for p in pos) / len(pos)
+            cur = bid if buy else ask
+            lvl = (tp1 - near if buy else tp1 + near) if near else e + frac * (tp1 - e)
+            reached_be = (cur >= lvl and lvl > e) if buy else (cur <= lvl and lvl < e)
 
     if (pos and not rec["be_done"] and reached_be and not rec.get("no_auto_be")
             and CFG["management"].get("auto_be_after_tp1", True)):

@@ -80,12 +80,55 @@ def entry_level(side="BUY"):
 
 def entry_level_text():
     b, s_ = entry_level("BUY"), entry_level("SELL")
-    return (f"Точка входа в диапазоне сигнала: покупки {b * 100:.0f}%, продажи {s_ * 100:.0f}% "
-            "(0% — лучший край: у BUY нижний, у SELL верхний; 100% — худший). "
-            "Цена хуже точки — ставлю BUY/SELL LIMIT на неё. "
-            + ("Цена лучше диапазона (BUY — ниже, SELL — выше) — все три по рынку (куратор). "
-               if CFG.get("risk", {}).get("below_range") == "market" else "")
-            + "Изменить: /entry buy 20, /entry sell 80, /entry 50 (обе)")
+    return (f"Точка входа: покупки {b * 100:.0f}%, продажи {s_ * 100:.0f}%\n"
+            "(0% — лучший край диапазона, 100% — худший)")
+
+
+def rules_text():
+    """Включённые сейчас правила — по одному на строку (для сообщения при запуске и /status)."""
+    rk = CFG.get("risk", {})
+    mg = CFG.get("management", {})
+    gold = CFG.get("symbols", {}).get("GOLD", {})
+    L = ["📋 Включённые правила:"]
+    mode = rk.get("entry_mode", "limit")
+    if mode == "market":
+        L.append("• Вход сразу по рынку, как пришёл сигнал")
+    else:
+        b, s_ = entry_level("BUY"), entry_level("SELL")
+        L.append(f"• Точка входа: покупки {b * 100:.0f}%, продажи {s_ * 100:.0f}%")
+        L.append("   (0% — лучший край диапазона, 100% — худший)")
+        if mode != "limit":
+            L.append(f"• Режим входа: {mode}")
+        L.append(f"• Цена хуже точки входа → лимитка на точку, ждёт до {rk.get('pending_expiry_min', 240) // 60:g} ч")
+        if float(rk.get("entry_fallback_min", 0) or 0):
+            L.append(f"• Лимитка не исполнилась за {rk['entry_fallback_min']:g} мин → вход по рынку")
+    below = rk.get("below_range") or ("stop" if rk.get("out_of_range_stop") else "skip")
+    L.append({"market": "• Цена лучше диапазона → все три позиции по рынку (куратор)",
+              "stop": "• Цена лучше диапазона → стоп-ордер на краю диапазона",
+              "skip": "• Цена лучше диапазона → не вхожу"}.get(below, f"• below_range: {below}"))
+    if rk.get("above_range") == "rest":
+        L.append("• Цена хуже диапазона → позиции TP2 и TP3 по рынку, без TP1")
+    after = rk.get("after_tp1", "skip")
+    L.append({"skip": "• Цена уже прошла TP1 → не вхожу",
+              "rest": "• Цена уже прошла TP1 → TP2 и TP3 по рынку",
+              "rest_limit": "• Цена уже прошла TP1 → TP2 и TP3 по рынку, TP1 лимиткой"}.get(after, f"• after_tp1: {after}"))
+    if mg.get("auto_be_after_tp1", True):
+        L.append(f"• Цена дошла до TP1 → стоп остальных позиций в безубыток (+${gold.get('be_offset', 0):g})")
+    sl_rule = rk.get("sl_rule", "none") or "none"
+    L.append("• Стоп и тейки — как в сигнале канала" if sl_rule == "none" else f"• Стоп относительно тейков: {sl_rule}")
+    lot = (f"фиксированный {CFG['fixed_total_lot']:g}" if CFG.get("fixed_total_lot") else "по таблице куратора")
+    L.append(f"• Лот {lot}" + ("; «занижаем риск» / RISKY → лот ÷2" if CFG.get("halve_on_risky", True) else ""))
+    L.append(f"• Не больше {rk.get('max_active_signals', 2)} сигналов одновременно")
+    L.append(f"• Сигнал старше {rk.get('max_signal_age_sec', 120) // 60:g} мин → не вхожу")
+    if float(rk.get("max_daily_loss_pct", 0) or 0) > 0:
+        L.append(f"• Убыток за день больше {rk['max_daily_loss_pct']:g}% → новых входов до завтра нет")
+    if CFG.get("weekend", {}).get("enabled"):
+        L.append("• Пятница вечером → закрываю всё на выходные")
+    if CFG.get("guard", {}).get("enabled", True):
+        L.append("• Защита: опасная сделка → пауза и кнопки в группе")
+    if state.d.get("paused"):
+        L.append("⏸ Сейчас пауза: новые сигналы пропускаю (/resume)")
+    return "\n".join(L)
 
 
 link = None
@@ -935,25 +978,29 @@ async def handle_user_command(cmd, arg=""):
             for sd in sides:
                 state.d[f"entry_level_{sd.lower()}"] = v
             state.save()
-            await notify("✅ Сохранено. " + entry_level_text())
+            await notify("✅ Сохранено.\n\n" + entry_level_text() + "\n\nИзменить: /entry buy 20, /entry sell 80, /entry 50 (обе)")
         else:
-            await notify(entry_level_text())
+            await notify(entry_level_text() + "\n\nИзменить: /entry buy 20, /entry sell 80, /entry 50 (обе)")
         return
     if cmd == "status":
         acc = trader.account()
         pos, orders = trader.all_own()
-        lines = [f"Режим: {MODE} | счёт {acc.login} ({'демо' if acc.trade_mode == link.ACCOUNT_TRADE_MODE_DEMO else 'РЕАЛЬНЫЙ'})",
-                 f"Баланс {acc.balance:.2f}, эквити {acc.equity:.2f} {acc.currency}",
-                 f"Пауза: {'да' if state.d['paused'] else 'нет'}; дневной стоп: {'да' if state.d['day_paused'] else 'нет'}",
+        lines = [f"Режим: {MODE}",
+                 f"Счёт {acc.login} ({'демо' if acc.trade_mode == link.ACCOUNT_TRADE_MODE_DEMO else 'РЕАЛЬНЫЙ'})",
+                 f"Баланс {acc.balance:.2f} {acc.currency}, эквити {acc.equity:.2f}",
                  f"MT5: {'на связи' if mt5_ok else 'НЕТ СВЯЗИ'}",
-                 "📍 " + entry_level_text()]
+                 f"Пауза: {'да' if state.d['paused'] else 'нет'}",
+                 "",
+                 rules_text(),
+                 "",
+                 "Сделки:"]
         for p in pos:
             lines.append(f"• {p.symbol} {'BUY' if p.type == 0 else 'SELL'} {p.volume:g} @ {p.price_open:g} "
                          f"SL {p.sl:g} TP {p.tp:g} → {p.profit:+.2f}")
         for o in orders:
             lines.append(f"• отложенный ордер {o.symbol} {o.volume_current:g} @ {o.price_open:g}")
         if not pos and not orders:
-            lines.append("Открытых сделок нет.")
+            lines.append("открытых сделок нет")
         await notify("\n".join(lines))
     elif cmd == "pause":
         state.d["paused"] = True
@@ -1135,9 +1182,13 @@ async def main():
     acc, is_demo = trader.connect()
     mt5_ok = True
     warn = "" if trader.trade_allowed() else "\n⚠️ В терминале выключена алготорговля (Algo Trading) — ордера не пройдут!"
-    await notify(f"🚀 Копировщик запущен. Режим: {MODE}{' (только разбор, без ордеров)' if DRY else ''}\n"
-                 f"Канал: {channel_entity.title}\nСчёт {acc.login} ({'демо' if is_demo else 'РЕАЛЬНЫЙ'}), "
-                 f"баланс {acc.balance:.2f} {acc.currency}{warn}\n📍 {entry_level_text()}\n/help — команды")
+    await notify(f"🚀 Копировщик запущен\n\n"
+                 f"Режим: {MODE}{' (только разбор, без ордеров)' if DRY else ''}\n"
+                 f"Канал: {channel_entity.title}\n"
+                 f"Счёт {acc.login} ({'демо' if is_demo else 'РЕАЛЬНЫЙ'})\n"
+                 f"Баланс {acc.balance:.2f} {acc.currency}{warn}\n\n"
+                 f"{rules_text()}\n\n"
+                 f"Точка входа: /entry buy 20, /entry sell 80\n/help — все команды")
 
     @client.on(events.NewMessage(chats=channel_entity))
     async def on_new(event):

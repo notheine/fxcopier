@@ -203,7 +203,81 @@ def test_guard():
     assert G.sl_move_increases_risk("SELL", 4300, 4310, 4320)
 
 
+def test_btc_virtual():
+    """Биткоин FxPro: брокер не принимает стоп/тейк/лимитку ближе $200 (trade_stops_level 20000) — держим сами."""
+    from fake_mt5 import FakeMT5
+    from trader import Trader
+    cfg = {"magic": 770077, "lot_table": [[200, .01], [900, .05]], "risk": {"entry_level_buy": 0.5},
+           "symbols": {"BTC": {"enabled": True, "candidates": ["BITCOIN"], "entry_tolerance": 50, "max_spread": 60,
+                               "max_slippage": 30, "be_offset": 20, "min_sl_gap": 50, "risk_pct": 4}}}
+    sig = parse_signal("BTC BUY\n\n📍 83280 - 83100\n\n✅TP1: 83380\n✅TP2: 83490\n✅TP3: 83750\n\n❗️ SL: 82700")   # #1345
+    assert sig and sig.symbol == "BTC" and sig.zone == (83100, 83280) and sig.sl == 82700, sig
+
+    def fake(bid):
+        f = FakeMT5(1000); f.syms["BITCOIN"] = {"contract": 1.0, "stops": 20000}; f.spread = 0.0; f.bid = bid
+        return f
+    # 1) точка 50% = 83190, цена 83185 — по рынку; TP1 83380 всего в $195 — брокеру не отдаём, держим сами
+    f = fake(83185.0); t = Trader(cfg, f)
+    plan, why = t.prepare(1345, sig)
+    assert plan["action"] == "market" and [v for _, v in plan["positions"]] == [0.02, 0.02, 0.02], why   # 4% от $1000 / $490
+    orders, rep = t.execute(plan)
+    assert len(f.pos) == 3 and not f.fails, (f.fails, rep)
+    tp = {o["k"]: o.get("vtp") for o in orders}
+    assert tp == {1: 83380, 2: None, 3: None}, tp
+    assert sorted(p.tp for p in f.pos.values()) == [0.0, 83490.0, 83750.0]
+    rec = {"id": 1345, "side": "BUY", "symbol_key": "BTC", "symbol": "BITCOIN", "orders": orders}
+    f.tick(83381.0)
+    msgs = t.virtual_tick(rec)
+    assert len(f.pos) == 2 and "TP1" in msgs[0], msgs                        # TP1 закрыли сами
+    res = t.move_to_be(rec)                                                  # БУ 83205 — в $176 от цены: держим сами
+    assert len(f.pos) == 2 and all("держу сам" in r for r in res), res
+    assert all(p.sl == 82700 for p in f.pos.values())                        # у брокера остаётся исходный стоп
+    f.tick(83300.0); assert not t.virtual_tick(rec)
+    f.tick(83204.0)
+    msgs = t.virtual_tick(rec)
+    assert not f.pos and len(msgs) == 2 and all("стоп 83205" in m for m in msgs), msgs
+    assert f.balance > 1000
+    # 2) точка 20% = 83136, цена 83200 — лимитка в $64 от цены брокер не примет: ждём уровень сами
+    cfg["risk"]["entry_level_buy"] = 0.2
+    f = fake(83200.0); t = Trader(cfg, f)
+    plan, why = t.prepare(1346, sig)
+    assert plan["action"] == "limit" and plan["price"] == 83136, why
+    orders, rep = t.execute(plan)
+    assert not f.ord and not f.pos and all(o["kind"] == "vlimit" for o in orders) and "держу сам" in rep, rep
+    rec = {"id": 1346, "side": "BUY", "symbol_key": "BTC", "symbol": "BITCOIN", "orders": orders}
+    assert len(t.pending_of(rec)) == 3
+    f.tick(83150.0); assert not t.virtual_tick(rec) and not f.pos
+    f.tick(83130.0)
+    msgs = t.virtual_tick(rec)
+    assert len(f.pos) == 3 and not t.pending_of(rec) and len(msgs) == 3, msgs
+    assert sorted(p.tp for p in f.pos.values()) == [83380.0, 83490.0, 83750.0]   # от 83130 все тейки дальше $200
+    # 3) снятие виртуальных лимиток (цена дошла до TP1 без нас)
+    f = fake(83200.0); t = Trader(cfg, f)
+    orders, _ = t.execute(t.prepare(1347, sig)[0])
+    rec = {"id": 1347, "side": "BUY", "symbol_key": "BTC", "symbol": "BITCOIN", "orders": orders}
+    assert len(t.cancel_pending(rec)) == 3 and not t.pending_of(rec)
+    f.tick(83100.0); assert not t.virtual_tick(rec) and not f.pos
+    # 4) безубыток можно поставить, а TP2 у брокера уже ближе $200 к цене — брокер отклонит всё изменение:
+    #    тейк снимаем у брокера и держим сами, стоп ставим
+    s2 = parse_signal("BTC BUY\n82950-83050\nTP1: 83300\nTP2: 83420\nTP3: 83700\nSL: 82500")
+    f = fake(82960.0); t = Trader(cfg, f)                                   # точка 20% = 82970 — по рынку
+    orders, rep = t.execute(t.prepare(1348, s2)[0])
+    assert len(f.pos) == 3 and not any(o.get("vtp") for o in orders), rep    # от 82960 все тейки дальше $200
+    rec = {"id": 1348, "side": "BUY", "symbol_key": "BTC", "symbol": "BITCOIN", "orders": orders}
+    f.tick(83301.0)                                                          # TP1 у брокера
+    res = t.move_to_be(rec)
+    assert len(f.pos) == 2 and not f.fails, (res, f.fails)
+    assert all(p.sl == 82980 for p in f.pos.values()), [(p.sl, p.tp) for p in f.pos.values()]
+    assert sorted(p.tp for p in f.pos.values()) == [0.0, 83700.0] and t._odict(rec, [p for p in f.pos.values() if not p.tp][0])["vtp"] == 83420
+    f.tick(83421.0); msgs = t.virtual_tick(rec)
+    assert len(f.pos) == 1 and "TP2" in msgs[0], msgs
+    # 5) золото не меняется: дистанции нет — всё у брокера
+    g = FakeMT5(1000); g.bid = 4400.0
+    assert Trader({"symbols": {"GOLD": {"candidates": ["GOLD"]}}}, g)._fit(g.symbol_info("GOLD"), True, 4400, 4399.5, 4400.4) == (4399.5, 4400.4, None, None)
+
+
 if __name__ == "__main__":
-    for f in (test_signals, test_commands, test_entry, test_lots, test_channel_priority, test_after_tp1, test_entry_modes, test_guard):
+    for f in (test_signals, test_commands, test_entry, test_lots, test_channel_priority, test_after_tp1, test_entry_modes, test_guard,
+              test_btc_virtual):
         f()
     print("OK")

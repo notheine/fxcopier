@@ -121,6 +121,10 @@ def rules_text():
         L.append(f"• Лот фиксированный {CFG['fixed_total_lot']:g}")
     elif not CFG.get("halve_on_risky", True):
         L.append("• «Занижаем риск» / RISKY — лот НЕ уменьшаю")
+    btc = CFG.get("symbols", {}).get("BTC", {})
+    if btc.get("enabled"):
+        L.append(f"• Биткоин: лот — риск {btc.get('risk_pct', 0):g}% депозита до стопа; тейки, безубыток и лимитки "
+                 "ближе $200 к цене (брокер их не принимает) держу сам")
     L.append(f"• Не больше {rk.get('max_active_signals', 2)} сигналов одновременно (куратор)")
     L.append(f"• Сигнал пришёл позже {rk.get('max_signal_age_sec', 120) // 60:g} мин → спрашиваю в чате "
              "(если TP1 или стоп уже задеты — не вхожу)")
@@ -170,8 +174,8 @@ def now_msk():
     return dt.datetime.now(MSK)
 
 
-def entries_blocked():
-    """Причина, по которой новые входы запрещены, или None."""
+def entries_blocked(symbol_key=None):
+    """Причина, по которой новые входы запрещены, или None. symbol_key — для выходных (биткоин торгуется и в них)."""
     h = state.d.get("hold")
     if h and h.get("type") in ("trade", "account") and not h.get("ask"):
         return "защита ждёт вашего решения (кнопки в группе)"
@@ -187,7 +191,8 @@ def entries_blocked():
         hh, mm = map(int, wk.get("no_new_entries_after", "22:00").split(":"))
         if (n.hour, n.minute) >= (hh, mm):
             return "пятница вечер — новые сделки не открываю (на выходные не оставляем)"
-    if n.weekday() >= 5:
+    weekend_ok = CFG.get("symbols", {}).get(symbol_key or "", {}).get("weekend_trading", False)
+    if n.weekday() >= 5 and not weekend_ok:
         return "выходные, рынок закрыт"
     mx = CFG["risk"].get("max_active_signals", 2)
     if len(state.active()) >= mx:
@@ -256,7 +261,7 @@ async def handle_signal(msg, text, sig, late=False):
                    "14 раз, 7 в плюс и 7 в минус, итог −$106 (продажи с длинным стопом — 28 из 35 в плюс)")
     times = [t for t in state.d.get("sig_times", []) if time.time() - t < 3600]
     state.d["sig_times"] = times + [time.time()]
-    why = entries_blocked()
+    why = entries_blocked(sig.symbol)
     if why:
         rec["reason"] = why.split(" —")[0].split(" (")[0]
         state.signals[sid] = rec
@@ -354,7 +359,7 @@ async def finish_open(rec, sig, orders, rep, head):
         rec["status"] = "active"
         rec["orders"] = orders
         rec["symbol"] = trader.symbol(sig.symbol)
-        if any(o["kind"] in ("limit", "stop") for o in orders):
+        if any(o["kind"] in ("limit", "stop", "vlimit", "vstop") for o in orders):
             rec["pending_since"] = time.time()
             rec["pending_expiry_min"] = (CFG["risk"].get("limit_signal_expiry_min", 10080) if sig.is_limit
                                          else CFG["risk"].get("pending_expiry_min", 240))
@@ -756,6 +761,10 @@ async def daily_checks():
 
 
 async def check_signal(rec):
+    vmsgs = trader.virtual_tick(rec)          # уровни ближе дистанции брокера (биткоин), которые держим сами
+    if vmsgs:
+        state.save()
+        await notify(f"⚙️ Сигнал #{rec['id']}:\n" + "\n".join("• " + m for m in vmsgs))
     pos = trader.positions_of(rec)
     pend = trader.pending_of(rec)
     if not pos and not pend:
@@ -772,7 +781,7 @@ async def check_signal(rec):
     if pos and not rec.get("filled"):
         rec["filled"] = True
         state.save()
-        if all(o["kind"] in ("limit", "stop") for o in rec["orders"]):
+        if not any(o.get("via") for o in rec["orders"]) and all(o["kind"] in ("limit", "stop") for o in rec["orders"]):
             await notify(f"🎯 Сигнал #{rec['id']}: отложенный ордер исполнился — мы в позиции "
                          f"({len(pos)} шт. @ {pos[0].price_open:g})")
     bid, ask = trader.price(rec["symbol"])
@@ -903,7 +912,7 @@ def period_bounds(kind, n=None):
     if kind == "day":
         start = d0
     elif kind == "week":
-        start = d0 - dt.timedelta(days=d0.weekday())
+        start = d0 - dt.timedelta(days=(d0.weekday() + 2) % 7)   # с субботы: выходные (биткоин) входят в неделю
     elif kind == "month":
         start = d0.replace(day=1)
     elif kind == "prev_month":
@@ -960,7 +969,10 @@ async def scheduled_reports():
     sch = CFG.get("reports", {})
     if not sch.get("enabled", True):
         return
-    if n.weekday() < 5 and hm >= tuple(map(int, sch.get("daily_at", "23:50").split(":"))) \
+    def busy_today():                          # в выходные отчёт за день — только если были сигналы/сделки (биткоин)
+        t0, t1, _ = period_bounds("day", n)
+        return any(t0 <= r["created"] < t1 for r in state.signals.values()) or bool(journal_rows(t0, t1))
+    if (n.weekday() < 5 or busy_today()) and hm >= tuple(map(int, sch.get("daily_at", "23:50").split(":"))) \
             and state.d.get("rep_day") != today:
         state.d["rep_day"] = today
         state.save()

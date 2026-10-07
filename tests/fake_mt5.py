@@ -6,18 +6,22 @@ class FakeMT5:
     TRADE_ACTION_MODIFY=7; TRADE_ACTION_REMOVE=8; ORDER_FILLING_FOK=0; ORDER_FILLING_IOC=1; ORDER_FILLING_RETURN=2; ORDER_TIME_GTC=0
     def __init__(s, balance=1000.0):
         s.bid=4400.0; s.spread=0.15; s.pos={}; s.ord={}; s.ids=itertools.count(1000); s.balance=balance; s.deals=[]; s.reqs=0; s.fails=[]
+        s.syms={'GOLD':{'contract':100.0,'stops':0}}   # инструменты: размер контракта и мин. дистанция стопов (пункты)
     def initialize(s,**k): return True
     def reconnect_lib(s): pass
     def last_error(s): return (1,'ok')
     def account_info(s): return NS(login=1,server='demo',trade_mode=0,balance=s.balance,equity=s.balance+sum(s._pl(p) for p in s.pos.values()),currency='USD',margin_mode=2,margin_free=s.balance)
     def terminal_info(s): return NS(connected=True,trade_allowed=True)
-    def symbol_info(s,n): return NS(digits=2,point=0.01,trade_stops_level=0,filling_mode=1,volume_min=0.01,volume_step=0.01,trade_tick_size=0.01,trade_tick_value=1.0,trade_contract_size=100.0) if n=='GOLD' else None
+    def symbol_info(s,n):
+        c=s.syms.get(n)
+        return None if c is None else NS(digits=2,point=0.01,trade_stops_level=c['stops'],filling_mode=1,volume_min=0.01,volume_step=0.01,trade_tick_size=0.01,trade_tick_value=c['contract']*0.01,trade_contract_size=c['contract'])
+    def _gap(s,n): return s.syms.get(n,{'stops':0})['stops']*0.01
     def symbol_select(s,n,on=True): return True
     def order_calc_margin(s,t,n,v,px): return v*100*px/100.0   # плечо 1:100
     def symbol_info_tick(s,n): return NS(bid=s.bid,ask=round(s.bid+s.spread,2))
     def _pl(s,p,px=None):
         if px is None: px = s.bid if p.type==0 else s.bid+s.spread
-        return ((px-p.price_open) if p.type==0 else (p.price_open-px))*p.volume*100
+        return ((px-p.price_open) if p.type==0 else (p.price_open-px))*p.volume*s.syms.get(p.symbol,{'contract':100.0})['contract']
     def _close(s,p,px=None,why=''):
         pl=s._pl(p,px); s.balance+=pl; s.pos.pop(p.ticket); s.deals.append(NS(position_id=p.identifier,profit=pl,commission=0.0,swap=0.0,why=why))
     def positions_get(s,symbol=None): return [NS(**{**vars(p),'profit':s._pl(p)}) for p in s.pos.values()]
@@ -34,17 +38,28 @@ class FakeMT5:
             s._close(p,why='market'); return ok(order=t,price=r['price'])
         if a==1:
             # validate stops like a broker
-            px=r['price']; buy=r['type']==0
-            if (buy and not (r['sl']<px<r['tp'])) or (not buy and not (r['tp']<px<r['sl'])):
+            px=r['price']; buy=r['type']==0; sl=r.get('sl') or 0; tp=r.get('tp') or 0; g=s._gap(r['symbol']); ask=s.bid+s.spread
+            bad=(buy and ((sl and not sl<s.bid-g+1e-9) or (tp and not tp>=s.bid+g-1e-9))) or \
+                (not buy and ((sl and not sl>=ask+g-1e-9) or (tp and not tp<=ask-g+1e-9)))
+            if bad:
                 s.fails.append(('invalid stops',r)); return NS(retcode=10016,order=0,price=0,comment='Invalid stops')
             s.pos[t]=NS(ticket=t,identifier=t,symbol=r['symbol'],type=r['type'],volume=r['volume'],price_open=px,sl=r['sl'],tp=r['tp'],magic=r['magic'],comment=r['comment'])
             return ok(order=t,price=px)
         if a==5:
+            g=s._gap(r['symbol']); ask=s.bid+s.spread; px=r['price']; ty=r['type']
+            far={2:ask-px,3:px-s.bid,4:px-ask,5:s.bid-px}[ty]
+            if g and far<g-1e-9:
+                s.fails.append(('invalid price',r)); return NS(retcode=10015,order=0,price=0,comment='Invalid price')
+            buy=ty in (2,4); sl=r.get('sl') or 0; tp=r.get('tp') or 0
+            if g and ((sl and (px-sl if buy else sl-px)<g-1e-9) or (tp and (tp-px if buy else px-tp)<g-1e-9)):
+                s.fails.append(('invalid stops',r)); return NS(retcode=10016,order=0,price=0,comment='Invalid stops')
             s.ord[t]=NS(ticket=t,symbol=r['symbol'],type=r['type'],volume_current=r['volume'],price_open=r['price'],sl=r['sl'],tp=r['tp'],magic=r['magic'],comment=r['comment']); return NS(retcode=10008,order=t,price=r['price'],comment='')
         if a==6:
             p=s.pos[r['position']]
             buy=p.type==0; cur=s.bid if buy else s.bid+s.spread
-            if r['sl'] and ((buy and r['sl']>=cur) or (not buy and r['sl']<=cur)):
+            g=s._gap(p.symbol)
+            if (r['sl'] and ((buy and r['sl']>cur-g-1e-9) or (not buy and r['sl']<cur+g+1e-9))) or \
+               (r['tp'] and g and ((buy and r['tp']<cur+g) or (not buy and r['tp']>cur-g))):
                 s.fails.append(('invalid sl modify',r)); return NS(retcode=10016,order=0,price=0,comment='Invalid stops')
             if (p.sl,p.tp)==(r['sl'],r['tp']): return NS(retcode=10025,order=0,price=0,comment='No changes')
             p.sl=r['sl']; p.tp=r['tp']; return ok()

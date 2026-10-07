@@ -11,6 +11,6 @@ DATA="$(cd "${DATA:-./bt_data}" && pwd)"; OUT="${OUT:-./bt_runs}"; PY="${PY:-pyt
 tag=$1; shift
 rm -rf "$OUT/r_$tag"; mkdir -p "$OUT/r_$tag/logs"; cd "$OUT/r_$tag"
 cp "$REPO"/{main,trader,parser,guard,mt5link}.py "$REPO/tests/fake_mt5.py" "$BT/bt3.py" .
-cp "$DATA/config.yaml" "$DATA/ch.json" . ; ln -sf "$DATA/gold_hybrid.csv" .
+cp "$DATA/config.yaml" "$DATA"/ch*.json . ; for c in "$DATA"/*_hybrid.csv; do ln -sf "$c" .; done
 env TAG=$tag "$@" "$PY" bt3.py > out.txt 2>&1
 tail -1 out.txt

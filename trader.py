@@ -4,6 +4,7 @@
 """
 import math
 import logging
+from types import SimpleNamespace
 
 log = logging.getLogger("trader")
 
@@ -202,6 +203,13 @@ class Trader:
         acc = self.mt5.account_info()
         fixed = self.cfg.get("fixed_total_lot")
         total = float(fixed) if fixed else lot_from_table(acc.balance, self.cfg["lot_table"])
+        sc = self.cfg.get("symbols", {}).get(sig.symbol, {})
+        if sc.get("risk_pct") and not fixed:
+            # лот от риска: при стопе теряем risk_pct % баланса (таблица куратора — для золота, к биткоину не подходит)
+            info = self.mt5.symbol_info(self.symbol(sig.symbol))
+            dist = abs(sum(sig.zone) / 2 - sig.sl)
+            per_lot = self.money(info, 1.0, dist) if info is not None and dist > 0 else 0
+            total = acc.balance * float(sc["risk_pct"]) / 100 / per_lot if per_lot else 0.0
         reduce = sig.reduce or (sig.risky and self.cfg.get("halve_on_risky", True))
         if reduce:
             total *= 0.5
@@ -226,8 +234,9 @@ class Trader:
         if spread > sc.get("max_spread", 1e9):
             return None, f"спред {spread:.2f} больше допустимого {sc['max_spread']} — пропускаю"
 
-        stops_gap = max(int(info.trade_stops_level), 0) * info.point
-        min_gap = max(stops_gap, spread * 2, sc.get("min_sl_gap", 0))
+        # минимальная дистанция брокера (trade_stops_level) здесь не нужна: стопы/тейки/лимитки ближе неё
+        # копировщик держит сам (виртуальные уровни, см. _fit и virtual_tick)
+        min_gap = max(spread * 2, sc.get("min_sl_gap", 0))
         rk = self.cfg.get("risk", {})
         level = float(rk.get(f"entry_level_{sig.side.lower()}", rk.get("entry_level", 0.5)))
         mode = rk.get("entry_mode", "limit")          # limit — только в диапазоне (лимитка на точку); market — сразу по рынку
@@ -391,48 +400,153 @@ class Trader:
         sid = plan["sid"]
         buy = sig.side == "BUY"
         out, errs = [], []
+        virt = []
         for k, vol in plan["positions"]:
             action, price = plan.get("per_k", {}).get(k, (plan["action"], plan["price"]))
-            req = {
-                "symbol": name,
-                "volume": float(vol),
-                "sl": self._norm(info, plan.get("sl_k", {}).get(k, sig.sl)),
-                "tp": self._norm(info, sig.tps[k]),
-                "magic": self.magic,
-                "comment": f"WW{sid}-{k}",
-                "type_time": self.mt5.ORDER_TIME_GTC,
-            }
+            sl = self._norm(info, plan.get("sl_k", {}).get(k, sig.sl))
+            tp = self._norm(info, sig.tps[k])
             if action == "market":
-                t = self.mt5.symbol_info_tick(name)
-                req.update({
-                    "action": self.mt5.TRADE_ACTION_DEAL,
-                    "type": self.mt5.ORDER_TYPE_BUY if buy else self.mt5.ORDER_TYPE_SELL,
-                    "price": t.ask if buy else t.bid,
-                    "deviation": int(round(sc.get("max_slippage", 0.5) / info.point)),
-                    "type_filling": self._filling(info),
-                })
+                ok, res, err, req, vsl, vtp = self._market(name, info, buy, vol, sl, tp, f"WW{sid}-{k}",
+                                                           sc.get("max_slippage", 0.5))
+                if ok:
+                    o = {"ticket": int(res.order), "k": k, "kind": "market", "volume": vol,
+                         "price": float(res.price or req["price"])}
+                    o.update({"vsl": vsl} if vsl else {}); o.update({"vtp": vtp} if vtp else {})
+                    out.append(o)
+                    if vsl or vtp:
+                        virt.append(k)
+                else:
+                    errs.append(f"TP{k}: {err}")
+                continue
+            t = self.mt5.symbol_info_tick(name)
+            gap = self._gap(info)
+            price = self._norm(info, price)
+            if action == "limit":
+                far = (t.ask - price) if buy else (price - t.bid)
             else:
-                req.update({
-                    "action": self.mt5.TRADE_ACTION_PENDING,
-                    "type": ((self.mt5.ORDER_TYPE_BUY_LIMIT if buy else self.mt5.ORDER_TYPE_SELL_LIMIT)
-                             if action == "limit" else
-                             (self.mt5.ORDER_TYPE_BUY_STOP if buy else self.mt5.ORDER_TYPE_SELL_STOP)),
-                    "price": self._norm(info, price),
-                    "type_filling": self.mt5.ORDER_FILLING_RETURN,
-                })
+                far = (price - t.ask) if buy else (t.bid - price)
+            if gap > 0 and far < gap * 1.05:
+                # брокер не даёт поставить отложенный ордер так близко к цене — ждём уровень сами
+                out.append({"ticket": -(int(sid) * 10 + k), "k": k, "kind": "v" + action, "volume": vol,
+                            "price": price, "sl": sl, "tp": tp, "state": "wait"})
+                virt.append(k)
+                continue
+            bsl, btp, vsl, vtp = self._fit(info, buy, price, sl, tp)
+            req = {
+                "symbol": name, "volume": float(vol), "sl": bsl, "tp": btp, "magic": self.magic,
+                "comment": f"WW{sid}-{k}", "type_time": self.mt5.ORDER_TIME_GTC,
+                "action": self.mt5.TRADE_ACTION_PENDING,
+                "type": ((self.mt5.ORDER_TYPE_BUY_LIMIT if buy else self.mt5.ORDER_TYPE_SELL_LIMIT)
+                         if action == "limit" else
+                         (self.mt5.ORDER_TYPE_BUY_STOP if buy else self.mt5.ORDER_TYPE_SELL_STOP)),
+                "price": price, "type_filling": self.mt5.ORDER_FILLING_RETURN,
+            }
             ok, res, err = self._send(req)
             if ok:
-                out.append({"ticket": int(res.order), "k": k, "kind": action, "volume": vol,
-                            "price": float(res.price or req["price"])})
+                o = {"ticket": int(res.order), "k": k, "kind": action, "volume": vol, "price": float(res.price or price)}
+                o.update({"vsl": vsl} if vsl else {}); o.update({"vtp": vtp} if vtp else {})
+                out.append(o)
+                if vsl or vtp:
+                    virt.append(k)
             else:
                 errs.append(f"TP{k}: {err}")
         rep = plan["head"]
+        if virt:
+            rep += (f"\nℹ️ Брокер не даёт ставить уровни ближе ${self._gap(info):g} к цене — "
+                    f"TP{', TP'.join(map(str, sorted(set(virt))))}: ближние тейки/стоп/вход держу сам")
         done = [o for o in out if o["kind"] == "market"]
         if done:
             rep += "\nИсполнено: " + ", ".join(f"TP{o['k']} {o['volume']:g} @ {o['price']:g}" for o in done)
         if errs:
             rep += "\n⚠️ Ошибки: " + "; ".join(errs)
         return out, rep
+
+    # ---- виртуальные уровни: брокер не даёт ставить стоп/тейк/лимитку ближе trade_stops_level к цене
+    #      (FxPro BITCOIN — $200, а TP1 в сигналах бывает в $100). Такие уровни копировщик держит сам:
+    #      у брокера — стоп-страховка подальше, а закрытие/вход по рынку делает virtual_tick (раз в 0.5 с).
+    def _gap(self, info):
+        return max(int(getattr(info, "trade_stops_level", 0) or 0), 0) * info.point
+
+    def _fit(self, info, buy, ref, sl, tp):
+        """(стоп брокеру, тейк брокеру, виртуальный стоп, виртуальный тейк) относительно цены ref."""
+        gap = self._gap(info)
+        if gap <= 0:
+            return sl, tp, None, None
+        s = 1 if buy else -1
+        need = gap * 1.05
+        bsl, btp, vsl, vtp = sl, tp, None, None
+        if tp and s * (tp - ref) < need:
+            btp, vtp = 0.0, tp
+        if sl and s * (ref - sl) < need:
+            bsl, vsl = self._norm(info, ref - s * gap * 1.2), sl     # страховка у брокера — дальше
+        return bsl, btp, vsl, vtp
+
+    def _market(self, name, info, buy, vol, sl, tp, comment, slippage):
+        t = self.mt5.symbol_info_tick(name)
+        bsl, btp, vsl, vtp = self._fit(info, buy, t.bid if buy else t.ask, sl, tp)
+        req = {"action": self.mt5.TRADE_ACTION_DEAL, "symbol": name, "volume": float(vol),
+               "type": self.mt5.ORDER_TYPE_BUY if buy else self.mt5.ORDER_TYPE_SELL,
+               "price": t.ask if buy else t.bid, "sl": bsl, "tp": btp,
+               "deviation": int(round(slippage / info.point)), "magic": self.magic, "comment": comment,
+               "type_time": self.mt5.ORDER_TIME_GTC, "type_filling": self._filling(info)}
+        ok, res, err = self._send(req)
+        return ok, res, err, req, vsl, vtp
+
+    def _odict(self, rec, p):
+        """Запись ордера сигнала (rec["orders"]) для позиции p — там хранятся виртуальные стоп/тейк."""
+        k = self.k_of(rec, p.identifier, p.comment)
+        best = None
+        for o in rec.get("orders", []):
+            if o["ticket"] == int(p.identifier):
+                return o
+            if o["k"] == k and not o["kind"].startswith("v"):
+                best = o
+        return best
+
+    def virtual_tick(self, rec):
+        """Исполнить виртуальные уровни сигнала по текущей цене. Возвращает строки для отчёта."""
+        msgs = []
+        name = rec.get("symbol")
+        if not name:
+            return msgs
+        buy = rec["side"] == "BUY"
+        bid, ask = self.price(name)
+        info = self.mt5.symbol_info(name)
+        sc = self.scfg(rec["symbol_key"])
+        for o in list(rec.get("orders", [])):
+            if not o["kind"].startswith("v") or o.get("state") != "wait":
+                continue
+            if o["kind"] == "vlimit":
+                hit = (ask <= o["price"]) if buy else (bid >= o["price"])
+            else:
+                hit = (ask >= o["price"]) if buy else (bid <= o["price"])
+            if not hit:
+                continue
+            o["state"] = "done"
+            ok, res, err, req, vsl, vtp = self._market(name, info, buy, o["volume"], o["sl"], o["tp"],
+                                                       f"WW{rec['id']}-{o['k']}", sc.get("max_slippage", 0.5))
+            if ok:
+                n = {"ticket": int(res.order), "k": o["k"], "kind": "market", "volume": o["volume"],
+                     "price": float(res.price or req["price"]), "via": o["kind"]}
+                n.update({"vsl": vsl} if vsl else {}); n.update({"vtp": vtp} if vtp else {})
+                rec["orders"].append(n)
+                msgs.append(f"TP{o['k']}: цена дошла до {o['price']:g} — вошёл по рынку @ {n['price']:g}")
+            else:
+                msgs.append(f"TP{o['k']}: цена дошла до {o['price']:g}, но вход НЕ удался: {err}")
+        for p in self.positions_of(rec):
+            o = self._odict(rec, p)
+            if not o or not (o.get("vsl") or o.get("vtp")):
+                continue
+            pb = p.type == self.mt5.POSITION_TYPE_BUY
+            cur = bid if pb else ask
+            k = o["k"]
+            if o.get("vtp") and ((cur >= o["vtp"]) if pb else (cur <= o["vtp"])):
+                ok, _, err = self.close_position(p)
+                msgs.append(f"TP{k} {o['vtp']:g} — закрыл сам ({p.profit:+.2f})" + ("" if ok else f" НЕ удалось: {err}"))
+            elif o.get("vsl") and ((cur <= o["vsl"]) if pb else (cur >= o["vsl"])):
+                ok, _, err = self.close_position(p)
+                msgs.append(f"TP{k}: стоп {o['vsl']:g} — закрыл сам ({p.profit:+.2f})" + ("" if ok else f" НЕ удалось: {err}"))
+        return msgs
 
     def open_signal(self, sid: int, sig, dry_run=False):
         """Подготовить и сразу исполнить (без проверки риска). Возвращает (ордера, отчёт)."""
@@ -476,8 +590,14 @@ class Trader:
     def pending_of(self, rec):
         tickets = {o["ticket"] for o in rec.get("orders", [])}
         pref = f"WW{rec['id']}-"
-        return [o for o in self.mt5.orders_get()
-                if o.magic == self.magic and (int(o.ticket) in tickets or str(o.comment).startswith(pref))]
+        res = [o for o in self.mt5.orders_get()
+               if o.magic == self.magic and (int(o.ticket) in tickets or str(o.comment).startswith(pref))]
+        for d in rec.get("orders", []):          # виртуальные лимитки (брокер не дал поставить близко к цене)
+            if d["kind"].startswith("v") and d.get("state") == "wait":
+                res.append(SimpleNamespace(ticket=d["ticket"], symbol=rec.get("symbol"), price_open=d["price"],
+                                           volume_current=d["volume"], sl=d["sl"], tp=d["tp"], magic=self.magic,
+                                           comment=f"WW{rec['id']}-{d['k']}", virtual=d))
+        return res
 
     def k_of(self, rec, ticket_or_identifier, comment=""):
         for o in rec.get("orders", []):
@@ -511,6 +631,10 @@ class Trader:
         return self._send(req)
 
     def modify_order(self, o, price=None, sl=None, tp=None):
+        d = getattr(o, "virtual", None)
+        if d is not None:
+            d.update({kk: v for kk, v in (("price", price), ("sl", sl), ("tp", tp)) if v is not None})
+            return True, None, ""
         info = self.mt5.symbol_info(o.symbol)
         req = {"action": self.mt5.TRADE_ACTION_MODIFY, "order": int(o.ticket), "symbol": o.symbol,
                "price": self._norm(info, price if price is not None else o.price_open),
@@ -520,6 +644,10 @@ class Trader:
         return self._send(req)
 
     def cancel_order(self, o):
+        d = getattr(o, "virtual", None)
+        if d is not None:
+            d["state"] = "cancelled"
+            return True, None, ""
         return self._send({"action": self.mt5.TRADE_ACTION_REMOVE, "order": int(o.ticket)})
 
     def close_all(self, rec):
@@ -587,16 +715,16 @@ class Trader:
                 msgs.append(f"лимитка #{o.ticket} НЕ снята: {err}")
                 continue
             info = self.mt5.symbol_info(o.symbol)
-            t = self.mt5.symbol_info_tick(o.symbol)
-            req = {"action": self.mt5.TRADE_ACTION_DEAL, "symbol": o.symbol, "volume": float(o.volume_current),
-                   "type": self.mt5.ORDER_TYPE_BUY if buy else self.mt5.ORDER_TYPE_SELL,
-                   "price": t.ask if buy else t.bid, "sl": o.sl, "tp": o.tp,
-                   "deviation": int(round(sc.get("max_slippage", 0.5) / info.point)), "magic": self.magic,
-                   "comment": o.comment, "type_time": self.mt5.ORDER_TIME_GTC, "type_filling": self._filling(info)}
-            ok, res, err = self._send(req)
+            od = self._odict(rec, SimpleNamespace(identifier=o.ticket, comment=o.comment)) or {}
+            sl = od.get("vsl") or o.sl
+            tp = od.get("vtp") or o.tp
+            ok, res, err, req, vsl, vtp = self._market(o.symbol, info, buy, o.volume_current, sl, tp, o.comment,
+                                                       sc.get("max_slippage", 0.5))
             if ok:
                 px = float(res.price or req["price"])
-                new.append({"ticket": int(res.order), "k": k, "kind": "market", "volume": o.volume_current, "price": px})
+                n = {"ticket": int(res.order), "k": k, "kind": "market", "volume": o.volume_current, "price": px}
+                n.update({"vsl": vsl} if vsl else {}); n.update({"vtp": vtp} if vtp else {})
+                new.append(n)
                 msgs.append(f"TP{k} {o.volume_current:g} по рынку @ {px:g}")
             else:
                 msgs.append(f"TP{k}: по рынку НЕ открылась: {err}")
@@ -628,12 +756,39 @@ class Trader:
             return sl < t.bid - gap
         return sl > t.ask + gap
 
+    def _modify_sl(self, rec, p, sl):
+        """Сменить стоп позиции. Если тейк у брокера уже ближе его дистанции к цене, брокер отклонит
+        всё изменение (Invalid stops) — тогда тейк снимаем у брокера и держим сами."""
+        info = self.mt5.symbol_info(p.symbol)
+        gap = self._gap(info)
+        tp = p.tp
+        if gap > 0 and tp:
+            t = self.mt5.symbol_info_tick(p.symbol)
+            pb = p.type == self.mt5.POSITION_TYPE_BUY
+            if ((tp - t.bid) if pb else (t.ask - tp)) < gap * 1.05:
+                o = self._odict(rec, p)
+                if o is not None:
+                    o["vtp"] = tp
+                    tp = 0.0
+        return self.modify_position(p, sl=sl, tp=tp)
+
+    def _beyond(self, p, level):
+        """Цена уже за уровнем стопа (для BUY — ниже или на нём)."""
+        t = self.mt5.symbol_info_tick(p.symbol)
+        return (t.bid <= level) if p.type == self.mt5.POSITION_TYPE_BUY else (t.ask >= level)
+
     def set_sl(self, rec, price, close_if_invalid=False):
         msgs = []
         for p in self.positions_of(rec):
+            o = self._odict(rec, p)
             if self._valid_sl(p, price):
-                ok, _, err = self.modify_position(p, sl=price)
+                ok, _, err = self._modify_sl(rec, p, price)
+                if ok and o is not None:
+                    o.pop("vsl", None)
                 msgs.append(f"#{p.ticket}: стоп → {price:g}" + ("" if ok else f" НЕ удалось: {err}"))
+            elif o is not None and self._gap(self.mt5.symbol_info(p.symbol)) > 0 and not self._beyond(p, price):
+                o["vsl"] = price                     # брокер не даёт так близко — держу сам
+                msgs.append(f"#{p.ticket}: стоп → {price:g} (держу сам: брокер не даёт ставить так близко)")
             elif close_if_invalid:
                 ok, _, err = self.close_position(p)
                 msgs.append(f"#{p.ticket}: цена уже за уровнем {price:g} — закрыта по рынку"
@@ -654,11 +809,18 @@ class Trader:
             info = self.mt5.symbol_info(p.symbol)
             be = round(p.price_open + (off if is_buy else -off), int(info.digits))
             eps = info.point / 2
-            if (is_buy and p.sl >= be - eps) or (not is_buy and 0 < p.sl <= be + eps):
+            o = self._odict(rec, p)
+            sl = (o or {}).get("vsl") or p.sl
+            if (is_buy and sl >= be - eps) or (not is_buy and 0 < sl <= be + eps):
                 continue  # уже в безубытке или лучше
             if self._valid_sl(p, be):
-                ok, _, err = self.modify_position(p, sl=be)
+                ok, _, err = self._modify_sl(rec, p, be)
+                if ok and o is not None:
+                    o.pop("vsl", None)
                 msgs.append(f"#{p.ticket}: стоп в безубыток {be:g}" + ("" if ok else f" НЕ удалось: {err}"))
+            elif o is not None and self._gap(info) > 0 and not self._beyond(p, be):
+                o["vsl"] = be                        # брокер не даёт ставить стоп так близко к цене — держу сам
+                msgs.append(f"#{p.ticket}: стоп в безубыток {be:g} (держу сам: брокер не даёт ближе ${self._gap(info):g})")
             else:
                 ok, _, err = self.close_position(p)
                 msgs.append(f"#{p.ticket}: цена уже у точки входа — закрыта по рынку ({p.profit:+.2f})"
@@ -669,10 +831,31 @@ class Trader:
         msgs = []
         for p in self.positions_of(rec):
             if self.k_of(rec, p.identifier, p.comment) == k:
+                info = self.mt5.symbol_info(p.symbol)
+                t = self.mt5.symbol_info_tick(p.symbol)
+                pb = p.type == self.mt5.POSITION_TYPE_BUY
+                _, btp, _, vtp = self._fit(info, pb, t.bid if pb else t.ask, None, price)
+                o = self._odict(rec, p)
+                if vtp and o is not None:
+                    o["vtp"] = vtp                   # ближе дистанции брокера — тейк держу сам
+                    ok, _, err = self.modify_position(p, tp=0.0)
+                    msgs.append(f"#{p.ticket}: TP{k} → {price:g} (держу сам)" + ("" if ok else f" НЕ удалось: {err}"))
+                    continue
                 ok, _, err = self.modify_position(p, tp=price)
+                if ok and o is not None:
+                    o.pop("vtp", None)
                 msgs.append(f"#{p.ticket}: TP{k} → {price:g}" + ("" if ok else f" НЕ удалось: {err}"))
         for o in self.pending_of(rec):
             if self.k_of(rec, o.ticket, o.comment) == k:
+                if getattr(o, "virtual", None) is None:
+                    info = self.mt5.symbol_info(o.symbol)
+                    _, btp, _, vtp = self._fit(info, rec["side"] == "BUY", o.price_open, None, price)
+                    od = self._odict(rec, SimpleNamespace(identifier=o.ticket, comment=o.comment))
+                    if vtp and od is not None:
+                        od["vtp"] = vtp
+                        ok, _, err = self.modify_order(o, tp=0.0)
+                        msgs.append(f"лимитка #{o.ticket}: TP{k} → {price:g} (держу сам)" + ("" if ok else f" НЕ удалось: {err}"))
+                        continue
                 ok, _, err = self.modify_order(o, tp=price)
                 msgs.append(f"лимитка #{o.ticket}: TP{k} → {price:g}" + ("" if ok else f" НЕ удалось: {err}"))
         if not msgs:

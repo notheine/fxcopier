@@ -15,8 +15,8 @@ python3 -m venv venv && venv/bin/pip install telethon pyyaml tzdata
 DATA=/путь/bt PY=venv/bin/python tools/backtest/run.sh BASE
 DATA=/путь/bt PY=venv/bin/python tools/backtest/run.sh S2 CHASE_SELL=2
 ```
-Переменные: `START`, `END` (2026-5-27), `BAL` (1000), `COMM` ($ за лот за круг, 8), `ELB`/`ELS` (точка входа 0..1),
-`CHASE_BUY`/`CHASE_SELL` (правило куратора №4 — работают только с trader.py из коммита 85c7323, в основном коде правила нет). Другие настройки — правкой `config.yaml` в папке данных.
+Переменные: `SYM` (GOLD | BTC; для BTC — `btc_hybrid.csv`, стопы брокера не ближе $200, `BTCRISK` % риска), `CH` (файл сообщений), `START`, `END` (2026-5-27), `BAL` (1000), `COMM` ($ за лот за круг, 8), `ELB`/`ELS` (точка входа 0..1),
+`LOTX`, `SPLIT` (fill1/fill2/fill3 — полный лот по таблице), `BENEAR` (ранний БУ), `BEOFF`, `AUTOBE=0`, `BEK2=1` (БУ на TP2), `HALVE=0`, `BUYX`/`SELLX`, `MAXACT`, `EXP` (мин), `CHASE_BUY`/`CHASE_SELL` (правило куратора №4 — работают только с trader.py из коммита 85c7323, в основном коде правила нет). Другие настройки — правкой `config.yaml` в папке данных.
 Один прогон ≈ 4 мин на 1 ядре; варианты можно запускать параллельно (каждый в своей `r_TAG`).
 Защита (guard) и вопросы кнопками выключены — считается, что владелец жмёт «входить».
 

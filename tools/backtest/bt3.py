@@ -21,12 +21,55 @@ async def notify(t, buttons=None, alt=""): OUT.append((CLOCK[0],t))
 main.notify=notify
 cfg=main.CFG
 cfg['guard']={'enabled':False}
+SYM=E.get('SYM','GOLD')            # GOLD | BTC
+if SYM=='BTC':
+    cfg['symbols']['GOLD']['enabled']=False
+    cfg['symbols']['BTC'].update(enabled=True, candidates=['BITCOIN'], weekend_trading=True, risk_pct=float(E.get('BTCRISK','4')))
 cfg['risk']['ask_risky_buy']=False
 for side in ('buy','sell'):
     v=E.get(f'CHASE_{side.upper()}','')
     if v!='': cfg['risk'][f'chase_usd_{side}']=float(v)
+# --- варианты для прогонов (только стенд, основной код не меняется) ---
+if E.get('LOTX'): cfg['lot_table']=[[b,round(l*float(E['LOTX']),2)] for b,l in cfg['lot_table']]   # лот ×X
+if E.get('MAXACT'): cfg['risk']['max_active_signals']=int(E['MAXACT'])
+if E.get('EXP'): cfg['risk']['pending_expiry_min']=float(E['EXP'])
+if E.get('AUTOBE')=='0': cfg['management']['auto_be_after_tp1']=False      # без своего БУ, только по команде канала
+if E.get('BEOFF'): cfg['symbols']['GOLD']['be_offset']=float(E['BEOFF'])    # БУ «с запасом» $X
+if E.get('BENEAR'): cfg['management']['be_near_tp1_usd']=float(E['BENEAR']) # ранний БУ за $X до TP1
+if E.get('HALVE')=='0': cfg['halve_on_risky']=False
+if E.get('SPLIT') in ('fill1','fill2','fill3'):
+    # общий лот по таблице делится не поровну с округлением вниз (0.05 → 0.01×3), а полностью:
+    # остаток по 0.01 раздаётся позициям в заданном порядке (fill1: TP1→TP2→TP3, fill3: TP3→TP2→TP1, fill2: TP2→TP3→TP1)
+    _pp=TR.plan_positions
+    order={'fill1':[1,2,3],'fill2':[2,3,1],'fill3':[3,2,1]}[E['SPLIT']]
+    def _pp2(total,keys,vmin,vstep):
+        r=_pp(total,keys,vmin,vstep)
+        if len(r)<3 or r[0][1]<vmin-1e-9: return r
+        vol={k:v for k,v in r}; rem=int(round((total-sum(vol.values()))/vstep))
+        i=0
+        while rem>0:
+            k=order[i%3]
+            if k in vol: vol[k]=round(vol[k]+vstep,8); rem-=1
+            i+=1
+        return [(k,vol[k]) for k,_ in r]
+    TR.plan_positions=_pp2
+if E.get('BUYX') or E.get('SELLX'):
+    _lt=TR.Trader.lot_total
+    def _lt2(self,sig):
+        t,red=_lt(self,sig)
+        return t*float(E.get('BUYX' if sig.side=='BUY' else 'SELLX','1') or 1), red
+    TR.Trader.lot_total=_lt2
+if E.get('BEK2')=='1':
+    # безубыток при TP2 вместо TP1 (через be_k, как при входе после TP1)
+    _prep=TR.Trader.prepare
+    def _prep2(self,sid,sig,max_lot=None):
+        plan,txt=_prep(self,sid,sig,max_lot=max_lot)
+        if plan and not plan.get('be_k') and 2 in sig.tps: plan['be_k']=2
+        return plan,txt
+    TR.Trader.prepare=_prep2
 f=FakeMT5(float(E.get('BAL','1000')))
-COMM=float(E.get('COMM','8.0'))
+f.syms['BITCOIN']={'contract':1.0,'stops':int(E.get('BTCSTOPS','20000'))}   # FxPro: стопы не ближе $200
+COMM=float(E.get('COMM','8.0' if SYM=='GOLD' else '0'))
 _close=f._close
 def close(p,px=None,why=''):
     _close(p,px,why); f.balance-=COMM*p.volume; f.deals[-1].commission=-COMM*p.volume
@@ -37,9 +80,9 @@ for fn in ("state_bt.json","journal.jsonl"):
 main.state=main.State("state_bt.json")
 main.state.d['entry_level_buy']=float(E.get('ELB','0.2')); main.state.d['entry_level_sell']=float(E.get('ELS','0.8'))
 main.channel_entity=NS(title="Win Win")
-bars=[tuple(float(x) for x in r) for r in csv.reader(open('gold_hybrid.csv'))]   # М5 до 25.06, дальше М1
+bars=[tuple(float(x) for x in r) for r in csv.reader(open(E.get('BARS','gold_hybrid.csv' if SYM=='GOLD' else 'btc_hybrid.csv')))]   # М5, дальше М1
 def ts(d): return dt.datetime.strptime(d[:19],"%d.%m.%Y %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp()
-msgs=[m for m in json.load(open('ch.json')) if START<=ts(m['date'])<END]
+msgs=[m for m in json.load(open(E.get('CH','ch.json'))) if START<=ts(m['date'])<END]
 ERR=[]; HOLDS=[]; EQ=[]
 async def checks():
     try:
@@ -59,7 +102,7 @@ async def handle(m):
            reply_to=NS(reply_to_msg_id=m['reply']) if m['reply'] else None)
     sig=main.parse_signal(text, **cfg.get('sanity',{}))
     if sig:
-        if sig.symbol=='GOLD':
+        if sig.symbol==SYM:
             await main.handle_signal(msg,text,sig); await resolve()
         return
     cmds=main.parse_command(text)

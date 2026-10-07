@@ -52,10 +52,17 @@ class P:
     fade: bool = False    # проверка «наоборот»: входить против движения
     risk: float = 1.0     # % депозита на серию
     timeout: int = 0      # закрыть серию через N свечей M30 без новой доливки (0 — выкл)
-    mode: str = "bars"    # bars — n свечей подряд; er — «чистота» хода за n свечей; donch — пробой n свечей; random — случайно (проверка)
+    mode: str = "bars"    # bars — n свечей подряд; er — «чистота» хода; donch — пробой n свечей; leg — сильнейший ход за W; random — проверка
     er: float = 0.6       # для mode=er: |итоговый ход| / сумма |ходов свечей| ≥ er
     ema: int = 0          # фильтр старшего тренда: цена по нужную сторону EMA(ema) на M30 (0 — выкл)
     seed: int = 1
+    # mode=leg — «самый сильный ход за двое суток, почти без отскоков» (идея владельца 07.10.2026)
+    W: int = 96           # окно, свечей M30 (96 = двое суток)
+    lmin: float = 5.0     # ход от максимума окна ≥ lmin × ATR
+    bounce: float = 0.3   # самый большой отскок внутри хода ≤ bounce × ход
+    mindur: int = 6       # ход длится не меньше, свечей M30 (не одна новостная свеча)
+    spikecap: float = 0.0  # одна свеча ≤ spikecap × ход (0 — не проверять)
+    bm: float = 1.0       # стоп/трейл R = bm × самый большой отскок хода (но ≥ r × ATR)
 
 
 def load(path):
@@ -175,11 +182,67 @@ def _signal(m30, atr, j, p, seg, a):
     return 0
 
 
+def rolling_prev(m30, w):
+    """Минимум low и максимум high за w свечей ДО свечи j (без неё)."""
+    from collections import deque
+    lo, hi = [None] * len(m30), [None] * len(m30)
+    qa, qb = deque(), deque()
+    for j, b in enumerate(m30):
+        while qa and qa[0] < j - w:
+            qa.popleft()
+        while qb and qb[0] < j - w:
+            qb.popleft()
+        if j >= w:
+            lo[j] = m30[qa[0]][3]
+            hi[j] = m30[qb[0]][2]
+        while qa and m30[qa[-1]][3] >= b[3]:
+            qa.pop()
+        qa.append(j)
+        while qb and m30[qb[-1]][2] <= b[2]:
+            qb.pop()
+        qb.append(j)
+    return lo, hi
+
+
+def leg_signal(m30, atr, j, p: P, roll):
+    """Закрытие свечи j — новый минимум (максимум) за окно W, ход от максимума (минимума) окна —
+    самый большой, длится ≥ mindur свечей, отскоки внутри ≤ bounce × ход.
+    Возвращает (направление, ход $, самый большой отскок $)."""
+    lo, hi = roll
+    if j < p.W + 20 or lo[j] is None:
+        return 0, 0, 0
+    c = m30[j][4]
+    if c < lo[j]:
+        d = -1
+        s = max(range(j - p.W, j + 1), key=lambda k: m30[k][2])
+        leg = m30[s][2] - c
+    elif c > hi[j]:
+        d = 1
+        s = min(range(j - p.W, j + 1), key=lambda k: m30[k][3])
+        leg = c - m30[s][3]
+    else:
+        return 0, 0, 0
+    if j - s < p.mindur or leg < p.lmin * atr[max(s - 1, 0)]:
+        return 0, 0, 0
+    # самый большой отскок против хода
+    mb, ext = 0.0, (m30[s][3] if d < 0 else m30[s][2])
+    for k in range(s + 1, j + 1):
+        b = m30[k]
+        mb = max(mb, (b[2] - ext) if d < 0 else (ext - b[3]))
+        ext = min(ext, b[3]) if d < 0 else max(ext, b[2])
+        if p.spikecap and d * (b[4] - b[1]) > p.spikecap * leg:
+            return 0, 0, 0
+    if mb > p.bounce * leg:
+        return 0, 0, 0
+    return d, leg, mb
+
+
 def run(bars, p: P, m30=None, atr=None, start_t=0, end_t=1 << 62):
     if m30 is None:
         m30 = to_m30(bars)
         atr = atr_series(m30)
     ema = ema_series(m30, p.ema) if p.ema else None
+    roll = rolling_prev(m30, p.W) if p.mode == "leg" else None
     _rnd.pop(p.seed, None)
     seqs = []
     bal = 1000.0
@@ -191,7 +254,13 @@ def run(bars, p: P, m30=None, atr=None, start_t=0, end_t=1 << 62):
         # сигнал на закрытии свечи j, вход на открытии свечи j+1
         nxt = m30[j + 1]
         if seq is None and start_t <= nxt[0] < end_t:
-            d = signal(m30, atr, j, p, ema)
+            mb = 0.0
+            if p.mode == "leg":
+                d, _, mb = leg_signal(m30, atr, j, p, roll)
+                if d and ema is not None and d * (m30[j][4] - ema[j]) <= 0:
+                    d = 0
+            else:
+                d = signal(m30, atr, j, p, ema)
             if p.fade:
                 d = -d
             dt = dtime(nxt[0])
@@ -205,7 +274,7 @@ def run(bars, p: P, m30=None, atr=None, start_t=0, end_t=1 << 62):
                 t, o, h, l, c, sp = bars[i0]
                 sp += SP_ADD
                 if sp <= p.maxsp:
-                    R = max(p.rmin, p.r * atr[j])
+                    R = max(p.rmin, p.r * atr[j], p.bm * mb)
                     ent = o + sp if d > 0 else o          # покупка по ask, продажа по bid
                     seq = Seq(d=d, t0=t, R=R)
                     stop = ent - R if d > 0 else ent + R  # покупка: по bid; продажа: по ask

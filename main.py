@@ -110,7 +110,7 @@ def rules_text():
         L.append("• Цена хуже диапазона → позиции TP2 и TP3 по рынку, без TP1")
     after = rk.get("after_tp1", "skip")
     L.append({"skip": "• Цена уже прошла TP1 → не вхожу",
-              "rest": "• Цена уже прошла TP1 → TP2 и TP3 по рынку",
+              "rest": "• Цена уже прошла TP1 → TP2 и TP3 по рынку (куратор)",
               "rest_limit": "• Цена уже прошла TP1 → TP2 и TP3 по рынку, TP1 лимиткой"}.get(after, f"• after_tp1: {after}"))
     if mg.get("auto_be_after_tp1", True):
         L.append(f"• Цена дошла до TP1 → стоп остальных позиций в безубыток (+${gold.get('be_offset', 0):g})")
@@ -122,7 +122,10 @@ def rules_text():
     elif not CFG.get("halve_on_risky", True):
         L.append("• «Занижаем риск» / RISKY — лот НЕ уменьшаю")
     L.append(f"• Не больше {rk.get('max_active_signals', 2)} сигналов одновременно (куратор)")
-    L.append(f"• Сигнал старше {rk.get('max_signal_age_sec', 120) // 60:g} мин → не вхожу")
+    L.append(f"• Сигнал пришёл позже {rk.get('max_signal_age_sec', 120) // 60:g} мин → спрашиваю в чате "
+             "(если TP1 или стоп уже задеты — не вхожу)")
+    if rk.get("ask_risky_buy", True):
+        L.append("• Покупка с длинным стопом («занижаем риск») → спрашиваю в чате")
     if float(rk.get("max_daily_loss_pct", 0) or 0) > 0:
         L.append(f"• Убыток за день больше {rk['max_daily_loss_pct']:g}% → новых входов до завтра нет")
     if CFG.get("weekend", {}).get("enabled"):
@@ -170,7 +173,7 @@ def now_msk():
 def entries_blocked():
     """Причина, по которой новые входы запрещены, или None."""
     h = state.d.get("hold")
-    if h and h.get("type") in ("trade", "account"):
+    if h and h.get("type") in ("trade", "account") and not h.get("ask"):
         return "защита ждёт вашего решения (кнопки в группе)"
     if state.d["paused"]:
         return "копировщик на паузе (/resume чтобы продолжить)"
@@ -236,22 +239,21 @@ async def handle_signal(msg, text, sig, late=False):
         await notify(head + "\n⏸ Трейдер пишет, что ещё не вошёл — жду отдельного сигнала/подтверждения.")
         return
     age = time.time() - msg.date.timestamp()
-    if late and age > CFG["risk"].get("max_signal_age_sec", 120):
-        # копировщик был недоступен (перезапуск/сбой) — сигнал догнали опросом канала
+    ask = []                       # причины спросить владельца кнопками (решение владельца 07.10)
+    if age > CFG["risk"].get("max_signal_age_sec", 120) and (late or not sig.is_limit):
+        # опоздание (сбой связи, перезапуск): если с публикации цена касалась TP1 или стопа — не входим
+        # (условие куратора), иначе спрашиваем владельца
         why = late_signal_problem(sig, msg, age)
         if why:
             rec["reason"] = "опоздание сигнала"
             state.signals[sid] = rec
             state.save()
-            await notify(head + f"\n⏭ Сигнал получен с опозданием {age / 60:.0f} мин (копировщик был недоступен): {why} — не вхожу.")
+            await notify(head + f"\n\n⏭ Сигнал получен с опозданием {age / 60:.0f} мин: {why} — не вхожу.")
             return
-        head += f"\n⚠️ Сигнал получен с опозданием {age / 60:.0f} мин (копировщик был недоступен); TP1 и стоп с тех пор не задеты — вхожу по обычным правилам."
-    elif age > CFG["risk"].get("max_signal_age_sec", 120) and not sig.is_limit:
-        rec["reason"] = "опоздание сигнала"
-        state.signals[sid] = rec
-        state.save()
-        await notify(head + f"\n⏭ Сигнал пришёл с опозданием {age:.0f} с — пропускаю.")
-        return
+        ask.append(f"сигнал получен с опозданием {age / 60:.0f} мин (TP1 и стоп с тех пор не задеты)")
+    if CFG["risk"].get("ask_risky_buy", True) and sig.side == "BUY" and (sig.reduce or sig.risky):
+        ask.append("покупка с длинным стопом («занижаем риск» / RISKY). На истории такие покупки: "
+                   "14 раз, 7 в плюс и 7 в минус, итог −$106 (продажи с длинным стопом — 28 из 35 в плюс)")
     times = [t for t in state.d.get("sig_times", []) if time.time() - t < 3600]
     state.d["sig_times"] = times + [time.time()]
     why = entries_blocked()
@@ -281,13 +283,34 @@ async def handle_signal(msg, text, sig, late=False):
         extra = ("\n🛡 Защита остановила бы: " + "; ".join(reasons)) if reasons else ""
         await notify(head + "\nℹ️ [тест, без ордеров] " + text_plan + extra)
         return
+    if plan and (reasons or ask) and state.d.get("hold"):
+        rec["reason"] = "жду ответа по другому сигналу"
+        state.signals[sid] = rec
+        state.save()
+        await notify(head + f"\n\n⏭ Нужно ваше решение ({'; '.join(reasons + ask)}), "
+                            f"но я уже жду ответа по сигналу #{state.d['hold'].get('sid')} — этот пропускаю.")
+        return
     if plan and reasons:
         rec["status"] = "held"
         rec["reason"] = "остановлено защитой"
         state.signals[sid] = rec
-        state.d["hold"] = {"type": "trade", "sid": sid, "reasons": reasons, "created": time.time()}
+        state.d["hold"] = {"type": "trade", "sid": sid, "reasons": reasons + ask, "created": time.time()}
         state.save()
-        await ask_trade(rec, plan, reasons, head)
+        await ask_trade(rec, plan, reasons + ask, head)
+        return
+    if plan and ask:
+        rec["status"] = "held"
+        rec["reason"] = "вопрос владельцу"
+        state.signals[sid] = rec
+        state.d["hold"] = {"type": "trade", "ask": True, "sid": sid, "reasons": ask, "created": time.time()}
+        state.save()
+        ttl = G.settings(CFG)["approval_ttl_min"]
+        await notify(f"{head}\n\n❓ НУЖНО ВАШЕ РЕШЕНИЕ:\n• " + "\n• ".join(ask)
+                     + f"\n\nЕсли входить: {plan['head']}"
+                     + f"\n\nЖду ответа {ttl} мин. Нет ответа — пропускаю. Другие сигналы обрабатываю как обычно.",
+                     buttons=[[Button.inline("✅ Входить", f"g:ok:{sid}".encode()),
+                               Button.inline("❌ Пропустить", f"g:no:{sid}".encode())]],
+                     alt="Ответьте: /approve — входить, /reject — пропустить")
         return
     if plan:
         orders, rep = trader.execute(plan)
@@ -381,6 +404,14 @@ async def ask_trade(rec, plan, reasons, head):
 async def guard_account_check():
     """Пауза по состоянию счёта: серия убытков, большая просадка. Плюс истечение вопросов по сделкам."""
     h = state.d.get("hold")
+    if h and h.get("ask") and time.time() - h["created"] > G.settings(CFG)["approval_ttl_min"] * 60:
+        rec = state.signals.get(str(h["sid"]))       # вопрос владельцу без ответа — просто пропускаем сигнал
+        if rec:
+            rec["status"], rec["reason"] = "skipped", "нет ответа на вопрос"
+        state.d["hold"] = None
+        state.save()
+        await notify(f"⌛️ Ответа по сигналу #{h['sid']} не было {G.settings(CFG)['approval_ttl_min']} мин — пропускаю.")
+        return
     if h and h["type"] == "trade" and time.time() - h["created"] > G.settings(CFG)["approval_ttl_min"] * 60:
         rec = state.signals.get(str(h["sid"]))
         if rec:

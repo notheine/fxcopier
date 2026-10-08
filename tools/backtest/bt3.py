@@ -80,12 +80,22 @@ for fn in ("state_bt.json","journal.jsonl"):
 main.state=main.State("state_bt.json")
 main.state.d['entry_level_buy']=float(E.get('ELB','0.2')); main.state.d['entry_level_sell']=float(E.get('ELS','0.8'))
 main.channel_entity=NS(title="Win Win")
+DUAL=E.get('DUAL')=='1'     # два профиля на одном счёте: «наши правила» + «строго по куратору» (как на сервере с 08.10)
+if DUAL:
+    for fn in ("state_bt_cur.json","journal_cur.jsonl"):
+        if os.path.exists(fn): os.remove(fn)
+    cfg_c=main.curator_cfg(cfg)
+    main.PROFILES[:]=[main.Profile("our","🔵 Наши правила",cfg,main.trader,main.state,"journal.jsonl"),
+                      main.Profile("cur","🟠 Строго по куратору",cfg_c,TR.Trader(cfg_c,f),main.State("state_bt_cur.json"),"journal_cur.jsonl")]
 bars=[tuple(float(x) for x in r) for r in csv.reader(open(E.get('BARS','gold_hybrid.csv' if SYM=='GOLD' else 'btc_hybrid.csv')))]   # М5, дальше М1
 def ts(d): return dt.datetime.strptime(d[:19],"%d.%m.%Y %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp()
 msgs=[m for m in json.load(open(E.get('CH','ch.json'))) if START<=ts(m['date'])<END]
 ERR=[]; HOLDS=[]; EQ=[]
 async def checks():
     try:
+        if DUAL:
+            await main.check_all()
+            return
         await main.daily_checks()
         for r in list(main.state.active()): await main.check_signal(r)
     except Exception: ERR.append(traceback.format_exc())
@@ -101,13 +111,15 @@ async def handle(m):
     msg=NS(id=m['id'],message=text,date=dt.datetime.fromtimestamp(CLOCK[0]-3*3600,dt.timezone.utc),
            reply_to=NS(reply_to_msg_id=m['reply']) if m['reply'] else None)
     sig=main.parse_signal(text, **cfg.get('sanity',{}))
-    if sig:
-        if sig.symbol==SYM:
-            await main.handle_signal(msg,text,sig); await resolve()
-        return
-    cmds=main.parse_command(text)
-    if cmds:
-        await main.handle_command(msg,text,cmds); await resolve()
+    for p in (main.PROFILES if DUAL else [None]):
+        with main.maybe_use(p):
+            if sig:
+                if sig.symbol==SYM:
+                    await main.handle_signal(msg,text,sig); await resolve()
+                continue
+            cmds=main.parse_command(text)
+            if cmds:
+                await main.handle_command(msg,text,cmds); await resolve()
 async def run():
     mi=0; last_day=None
     for b in bars:
@@ -140,6 +152,11 @@ w=[j['pnl'] for j in J if j['pnl']>0.5]; lo=[j['pnl'] for j in J if j['pnl']<-0.
 res=dict(signals=len(S),status=dict(collections.Counter(r['status'] for r in S.values())),trades=len(J),wins=len(w),losses=len(lo),
          pnl=round(sum(j['pnl'] for j in J),2),balance=round(acc.balance,2),equity=round(acc.equity,2),open=len(f.pos),
          max_dd_pct=round(mdd,1),errors=len(ERR),holds=len(HOLDS))
+if DUAL:
+    Jc=[json.loads(l) for l in open('journal_cur.jsonl')] if os.path.exists('journal_cur.jsonl') else []
+    res['curator']=dict(trades=len(Jc),pnl=round(sum(j['pnl'] for j in Jc),2),
+                        wins=sum(j['pnl']>0.5 for j in Jc),losses=sum(j['pnl']<-0.5 for j in Jc),
+                        status=dict(collections.Counter(r['status'] for r in main.PROFILES[1].state.signals.values())))
 print(json.dumps(res,ensure_ascii=False))
 for e in ERR[:3]: print(e[-1500:])
 json.dump({'res':res,'eq':EQ,'journal':J,'signals':S,'notes':OUT},open(f"bt_{E.get('TAG','x')}.json",'w'),ensure_ascii=False)

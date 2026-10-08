@@ -5,6 +5,8 @@
 Первый запуск спросит номер телефона и код из Telegram (вводится на сервере).
 """
 import asyncio
+import contextlib
+import copy
 import datetime as dt
 import json
 import logging
@@ -66,6 +68,73 @@ class State:
 
 
 state = State()
+OUR_STATE = state      # состояние основного профиля: служебное (опрос канала, отчёты по расписанию) — всегда отсюда
+
+
+# ------------------------------------------------------------------ профили (08.10.2026, просьба владельца)
+# На каждый сигнал — две независимые тройки позиций на одном счёте:
+#   «Наши правила» (magic 770077, WW…) — как раньше: точка входа 20/80, лимитки, защита, вопросы кнопками;
+#   «Строго по куратору» (magic 770079, WC…) — только правила канала и куратора, без наших добавлений.
+# Тренд-робот (trend.py) — третий источник, magic 770078. Отчёты — по каждому отдельно.
+# Код сделок один и тот же: на время обработки глобальные CFG/trader/state/JOURNAL подменяются на профиль (use),
+# все входы в торговую логику идут под LOCK, чтобы подмена не пересекалась с другой задачей.
+
+class Profile:
+    def __init__(self, key, label, cfg, trader_, state_, journal):
+        self.key, self.label, self.cfg, self.trader, self.state, self.journal = key, label, cfg, trader_, state_, journal
+
+
+PROFILES = []          # [наши, куратор]; пусто — один профиль (стенд прогонов, тесты)
+CUR = None             # профиль, который сейчас обрабатывается (для подписи сообщений)
+LOCK = asyncio.Lock()
+
+
+@contextlib.contextmanager
+def use(p):
+    global CFG, trader, state, JOURNAL, CUR
+    old = (CFG, trader, state, JOURNAL, CUR)
+    CFG, trader, state, JOURNAL, CUR = p.cfg, p.trader, p.state, p.journal, p
+    try:
+        yield p
+    finally:
+        CFG, trader, state, JOURNAL, CUR = old
+
+
+def curator_cfg(base):
+    """Настройки профиля «строго по куратору»: правила канала и куратора, без наших добавлений."""
+    c = copy.deepcopy(base)
+    over = base.get("curator_profile") or {}
+    c["magic"] = int(over.get("magic", 770079))
+    c["comment_tag"] = over.get("comment_tag", "WC")
+    rk = c.setdefault("risk", {})
+    rk.update({"entry_mode": "curator",      # №4: в диапазоне или до $2 хуже края — все три по рынку;
+               "curator_near_usd": 2.0,      # дальше — TP2/TP3 по рынку, БУ при TP1 (ответ куратора 06.10)
+               "below_range": "market",      # цена лучше диапазона — все три по рынку (куратор 06.10)
+               "after_tp1": "rest",          # цена уже прошла TP1 — TP2 и TP3 (куратор 06.10)
+               "max_active_signals": 2,      # куратор: не больше 2 сигналов одновременно
+               "ask_risky_buy": False, "ask_late": False,   # без вопросов кнопками (наше правило)
+               "max_daily_loss_pct": 0, "sl_rule": "none", "entry_fallback_min": 0, "above_range": None})
+    rk.update(over.get("risk") or {})
+    c["guard"] = {"enabled": False}          # защита — наше правило
+    c["weekend"] = dict(c.get("weekend") or {}, enabled=False)
+    c["management"] = dict(c.get("management") or {}, auto_be_after_tp1=True, be_near_tp1_usd=0, be_at_frac=0)
+    c["halve_on_risky"] = True               # «занижаем риск» — указание канала
+    return c
+
+
+def curator_rules_text():
+    c = PROFILES[1].cfg if len(PROFILES) > 1 else curator_cfg(CFG)
+    be = c.get("symbols", {}).get("GOLD", {}).get("be_offset", 0)
+    return "\n".join([
+        "📋 Строго по куратору (свои позиции, отдельный отчёт):",
+        f"• Цена в диапазоне или до ${c['risk'].get('curator_near_usd', 2):g} хуже края → все три по рынку",
+        "• Дальше → TP2 и TP3 по рынку, безубыток при TP1",
+        "• Цена лучше диапазона → все три по рынку",
+        "• Цена уже прошла TP1 → TP2 и TP3 по рынку",
+        f"• Цена дошла до TP1 → безубыток (+${be:g})",
+        f"• Не больше {c['risk'].get('max_active_signals', 2)} сигналов одновременно",
+        "• Опоздавший сигнал: TP1 и стоп не задеты — вхожу без вопросов",
+        "• Без защиты и без вопросов кнопками"])
 
 
 def entry_level(side="BUY"):
@@ -90,7 +159,7 @@ def rules_text():
     rk = CFG.get("risk", {})
     mg = CFG.get("management", {})
     gold = CFG.get("symbols", {}).get("GOLD", {})
-    L = ["📋 Включённые правила:"]
+    L = ["📋 Включённые правила" + (" (🔵 наши):" if len(PROFILES) > 1 else ":")]
     mode = rk.get("entry_mode", "limit")
     if mode == "market":
         L.append("• Вход сразу по рынку, как пришёл сигнал")
@@ -161,6 +230,13 @@ mt5_ok = False
 
 
 async def notify(text: str, buttons=None, alt="", image=None):
+    """Сообщение в группу. Во время обработки профиля — с подписью, откуда оно («🔵 Наши правила» / «🟠 Куратор»)."""
+    if CUR is not None and len(PROFILES) > 1:
+        text = f"{CUR.label}\n{text}"
+    await notify_plain(text, buttons=buttons, alt=alt, image=image)
+
+
+async def notify_plain(text: str, buttons=None, alt="", image=None):
     """Отчёт в группу (от бота). buttons — кнопки; alt — текстовая подсказка, если бота нет; image — PNG (bytes)."""
     log.info("NOTIFY: %s%s", text.replace("\n", " | "), " [+график]" if image else "")
     try:
@@ -268,7 +344,8 @@ async def handle_signal(msg, text, sig, late=False):
             state.save()
             await notify(head + f"\n\n⏭ Сигнал получен с опозданием {age / 60:.0f} мин: {why} — не вхожу.")
             return
-        ask.append(f"сигнал получен с опозданием {age / 60:.0f} мин (TP1 и стоп с тех пор не задеты)")
+        if CFG["risk"].get("ask_late", True):
+            ask.append(f"сигнал получен с опозданием {age / 60:.0f} мин (TP1 и стоп с тех пор не задеты)")
     if CFG["risk"].get("ask_risky_buy", True) and sig.side == "BUY" and (sig.reduce or sig.risky):
         ask.append("покупка с длинным стопом («занижаем риск» / RISKY). На истории такие покупки: "
                    "14 раз, 7 в плюс и 7 в минус, итог −$106 (продажи с длинным стопом — 28 из 35 в плюс)")
@@ -712,8 +789,9 @@ async def monitor():
     alerted = False
     while True:
         await asyncio.sleep(CFG.get("monitor_interval_sec", 0.5))
+        t0_ = PROFILES[0].trader if PROFILES else trader       # не зависим от подмены профиля в другой задаче
         try:
-            if not trader.healthy():
+            if not t0_.healthy():
                 raise ConnectionError("terminal not connected")
             if not mt5_ok:
                 mt5_ok = True
@@ -730,21 +808,42 @@ async def monitor():
                 last_reconnect = time.time()
                 try:
                     link.reconnect_lib()
-                    trader.connect()
+                    t0_.connect()
                 except Exception as e2:
                     log.warning("переподключение не удалось: %s", e2)
             continue
 
         try:
-            await daily_checks()
-            for rec in list(state.active()):
-                await check_signal(rec)
+            async with LOCK:
+                await scheduled_reports()
+                await check_all()
         except Exception:
             log.exception("ошибка в мониторе")
 
 
+def profiles():
+    """Профили для обработки: оба, если включён «куратор»; иначе — один текущий (стенд, тесты)."""
+    return PROFILES or [None]
+
+
+@contextlib.contextmanager
+def maybe_use(p):
+    if p is None:
+        yield None
+    else:
+        with use(p):
+            yield p
+
+
+async def check_all():
+    for p in profiles():
+        with maybe_use(p):
+            await daily_checks()
+            for rec in list(state.active()):
+                await check_signal(rec)
+
+
 async def daily_checks():
-    await scheduled_reports()
     await guard_account_check()
     n = now_msk()
     today = n.strftime("%Y-%m-%d")
@@ -936,6 +1035,88 @@ def period_bounds(kind, n=None):
 
 
 def build_report(kind):
+    """Отчёт за период. Несколько профилей — отдельный блок по каждому, тренд-робот, сравнение по сигналам."""
+    if len(PROFILES) < 2:
+        return build_report_one(kind)
+    t0, t1, start = period_bounds(kind)
+    names = {"day": f"📊 Итоги дня {start:%d.%m}", "week": f"📊 Итоги недели с {start:%d.%m}",
+             "month": f"📊 Итоги месяца {start:%m.%Y}", "prev_month": f"📊 Итоги месяца {start:%m.%Y}"}
+    lines = [names[kind]]
+    res, per_sig = [], []
+    for p in PROFILES:
+        with use(p):
+            block, pnl = profile_block(t0, t1)
+            rows = journal_rows(t0, t1)
+            per_sig.append({str(r["id"]): r["pnl"] for r in rows})
+            sigs = {str(r["id"]): r for r in state.signals.values() if t0 <= r["created"] < t1}
+            per_sig[-1]["_sigs"] = sigs
+        res.append(pnl)
+        lines += ["", p.label] + block
+    if TR:
+        tl = TR.report_line(t0, t1)
+        lines += ["", "🤖 Тренд-робот", tl or "серий не было"]
+    # по сигналам: итог по каждому профилю рядом
+    ids = sorted(set(per_sig[0]["_sigs"]) | set(per_sig[1]["_sigs"]), key=lambda x: int(x) if x.isdigit() else 0)
+    rows = []
+    for sid in ids:
+        r = per_sig[0]["_sigs"].get(sid) or per_sig[1]["_sigs"].get(sid)
+        if not r or r.get("status") == "invalid":
+            continue
+        def v(i):
+            if sid in per_sig[i]:
+                return f"{per_sig[i][sid]:+.2f}"
+            rr = per_sig[i]["_sigs"].get(sid)
+            if rr and rr.get("status") == "active":
+                return "в сделке" if was_in(rr) else "ждёт лимитку"
+            if rr and rr.get("orders") and not was_in(rr):
+                return "лимитка не исполнилась"
+            return "не вошёл" if not (rr and rr.get("orders")) else "0"
+        rows.append(f"• #{sid} {r.get('symbol_key', '')} {r['side']}: {v(0)} / {v(1)}")
+    if rows:
+        lines += ["", "По сигналам (наши / куратор):"] + rows[-12:]
+    d = res[0] - res[1]
+    lines += ["", ("Разница: наши правила лучше на " if d >= 0 else "Разница: куратор лучше на ") + f"{abs(d):.2f}"]
+    acc = trader.account() if trader else None
+    if acc:
+        lines.append(f"Баланс счёта (общий): {acc.balance:.2f} {acc.currency} | эквити {acc.equity:.2f}")
+    return "\n".join(lines)
+
+
+def was_in(r):
+    """Сделка по сигналу была (вход по рынку или исполнилась лимитка)."""
+    return bool(r.get("filled") or any(o.get("kind") == "market" for o in r.get("orders") or []))
+
+
+def profile_block(t0, t1):
+    """Блок отчёта по текущему профилю: сигналы, сделки, результат, открытое сейчас."""
+    sigs = [r for r in state.signals.values() if t0 <= r["created"] < t1]
+    entered = [r for r in sigs if was_in(r)]
+    unfilled = [r for r in sigs if r["orders"] and not was_in(r)]
+    skipped = [r for r in sigs if not r["orders"]]
+    reasons = {}
+    for r in skipped:
+        k = r.get("reason") or r["status"]
+        reasons[k] = reasons.get(k, 0) + 1
+    rows = journal_rows(t0, t1)
+    pnl = sum(r["pnl"] for r in rows)
+    wins = [r for r in rows if r["pnl"] > 0.5]
+    losses = [r for r in rows if r["pnl"] < -0.5]
+    L = [f"Сигналов: {len(sigs)} | вошёл: {len(entered)}"
+         + (f" | лимитка не исполнилась: {len(unfilled)}" if unfilled else "") + f" | пропустил: {len(skipped)}"]
+    for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:3]:
+        L.append(f"   • {k}: {v}")
+    L.append(f"Закрыто сделок: {len(rows)} | в плюс: {len(wins)} | в минус: {len(losses)}")
+    L.append(f"Результат: {pnl:+.2f}")
+    try:
+        pos, orders = trader.all_own()
+        if pos or orders:
+            L.append(f"Открыто сейчас: позиций {len(pos)}, лимиток {len(orders)}, плавающий {sum(p.profit for p in pos):+.2f}")
+    except Exception:
+        pass
+    return L, pnl
+
+
+def build_report_one(kind):
     t0, t1, start = period_bounds(kind)
     names = {"day": f"📊 Итоги дня {start:%d.%m}", "week": f"📊 Итоги недели с {start:%d.%m}",
              "month": f"📊 Итоги месяца {start:%m.%Y}", "prev_month": f"📊 Итоги месяца {start:%m.%Y}"}
@@ -1019,14 +1200,16 @@ async def handle_user_command(cmd, arg=""):
     cmd = cmd.lower()
     alias = {"approve": "ok", "approve_safe": "safe", "reject": "no", "slok": "slok", "slno": "slno"}
     if cmd in alias:
-        await notify(await resolve_hold(alias[cmd]))
+        with maybe_use(PROFILES[0] if PROFILES else None):
+            await notify(await resolve_hold(alias[cmd]))
         return
     if cmd == "resume" and state.d.get("hold"):
         h = state.d["hold"]
-        if h["type"] == "account":
-            await resolve_hold("resume")
-        elif h["type"] == "trade":
-            await resolve_hold("no")
+        with maybe_use(PROFILES[0] if PROFILES else None):
+            if h["type"] == "account":
+                await resolve_hold("resume")
+            elif h["type"] == "trade":
+                await resolve_hold("no")
     if cmd == "trend":
         if TR is None:
             await notify("Тренд-робот ещё не запущен.")
@@ -1069,40 +1252,52 @@ async def handle_user_command(cmd, arg=""):
                  f"MT5: {'на связи' if mt5_ok else 'НЕТ СВЯЗИ'}",
                  f"Пауза: {'да' if state.d['paused'] else 'нет'}",
                  "",
-                 rules_text(),
-                 "",
-                 "Сделки:"]
-        for p in pos:
-            lines.append(f"• {p.symbol} {'BUY' if p.type == 0 else 'SELL'} {p.volume:g} @ {p.price_open:g} "
-                         f"SL {p.sl:g} TP {p.tp:g} → {p.profit:+.2f}")
-        for o in orders:
-            lines.append(f"• отложенный ордер {o.symbol} {o.volume_current:g} @ {o.price_open:g}")
-        if not pos and not orders:
-            lines.append("открытых сделок нет")
+                 rules_text()]
+        if len(PROFILES) > 1:
+            lines += ["", curator_rules_text()]
+        for p_ in profiles():
+            with maybe_use(p_):
+                pos, orders = trader.all_own()
+                lines += ["", (p_.label if p_ else "Сделки") + ":"]
+                for p in pos:
+                    lines.append(f"• {p.symbol} {'BUY' if p.type == 0 else 'SELL'} {p.volume:g} @ {p.price_open:g} "
+                                 f"SL {p.sl:g} TP {p.tp:g} → {p.profit:+.2f}")
+                for o in orders:
+                    lines.append(f"• отложенный ордер {o.symbol} {o.volume_current:g} @ {o.price_open:g}")
+                if not pos and not orders:
+                    lines.append("открытых сделок нет")
         if TR:
             lines += ["", TR.status_text()]
         await notify("\n".join(lines))
     elif cmd == "pause":
-        state.d["paused"] = True
-        state.save()
-        await notify("⏸ Пауза: новые сигналы пропускаю. Открытые сделки веду дальше. /resume — продолжить.")
+        for p_ in profiles():
+            with maybe_use(p_):
+                state.d["paused"] = True
+                state.save()
+        await notify("⏸ Пауза: новые сигналы пропускаю (и наши правила, и куратор). Открытые сделки веду дальше. "
+                     "/resume — продолжить.")
     elif cmd == "resume":
-        state.d["paused"] = False
-        state.d["day_paused"] = False
-        state.save()
+        for p_ in profiles():
+            with maybe_use(p_):
+                state.d["paused"] = False
+                state.d["day_paused"] = False
+                state.save()
         await notify("▶️ Продолжаю входить в сигналы.")
     elif cmd == "closeall":
         lines = []
-        for rec in state.active():
-            lines += trader.close_all(rec)
-            rec["status"] = "closed"
-        pos, orders = trader.all_own()
-        for p in pos:
-            ok, _, err = trader.close_position(p)
-            lines.append(f"#{p.ticket} {'закрыта' if ok else 'ошибка ' + err}")
-        for o in orders:
-            ok, _, err = trader.cancel_order(o)
-            lines.append(f"лимитка #{o.ticket} {'снята' if ok else 'ошибка ' + err}")
+        for p_ in profiles():
+            with maybe_use(p_):
+                for rec in state.active():
+                    lines += trader.close_all(rec)
+                    rec["status"] = "closed"
+                pos, orders = trader.all_own()
+                for p in pos:
+                    ok, _, err = trader.close_position(p)
+                    lines.append(f"#{p.ticket} {'закрыта' if ok else 'ошибка ' + err}")
+                for o in orders:
+                    ok, _, err = trader.cancel_order(o)
+                    lines.append(f"лимитка #{o.ticket} {'снята' if ok else 'ошибка ' + err}")
+                state.save()
         if TR and TR.s["series"]:
             lines += TR.close_all()
             await TR._finish(TR.s["series"], "закрыл по /closeall")
@@ -1133,19 +1328,24 @@ async def trend_loop():
 # ------------------------------------------------------------------ запуск
 
 def _seen(mid):
-    return mid in state.d.setdefault("seen_ids", [])
+    return mid in OUR_STATE.d.setdefault("seen_ids", [])
 
 
 def _mark_seen(mid):
-    ids = state.d.setdefault("seen_ids", [])
+    ids = OUR_STATE.d.setdefault("seen_ids", [])
     ids.append(mid)
     del ids[:-300]
-    state.d["last_msg_id"] = max(state.d.get("last_msg_id") or 0, mid)
-    state.save()
+    OUR_STATE.d["last_msg_id"] = max(OUR_STATE.d.get("last_msg_id") or 0, mid)
+    OUR_STATE.save()
 
 
 async def process_channel_message(msg, late=False):
     """Сообщение канала (из события или догнанное опросом). Каждое обрабатывается один раз."""
+    async with LOCK:
+        await _process_channel_message(msg, late)
+
+
+async def _process_channel_message(msg, late=False):
     if _seen(msg.id):
         return
     _mark_seen(msg.id)
@@ -1155,11 +1355,23 @@ async def process_channel_message(msg, late=False):
         sig = parse_signal(text, **CFG.get("sanity", {}))
         if sig:
             await forward_signal(msg)
-            await handle_signal(msg, text, sig, late=late)
+            for p in profiles():
+                with maybe_use(p):
+                    try:
+                        await handle_signal(msg, text, sig, late=late)
+                    except Exception as e:
+                        log.exception("ошибка обработки сигнала")
+                        await notify(f"⚠️ Ошибка при обработке сигнала #{msg.id}: {e}")
             return
         cmds = parse_command(text)
         if cmds:
-            await handle_command(msg, text, cmds)
+            for p in profiles():
+                with maybe_use(p):
+                    try:
+                        await handle_command(msg, text, cmds)
+                    except Exception as e:
+                        log.exception("ошибка команды канала")
+                        await notify(f"⚠️ Ошибка при обработке сообщения #{msg.id}: {e}")
         elif looks_like_signal(text):
             await notify(f"❓ Похоже на сигнал, но разобрать не смог:\n{text[:500]}")
     except Exception as e:
@@ -1172,16 +1384,17 @@ async def poll_channel():
     Страховка от пропусков: Telegram не всегда досылает сообщения, пришедшие во время перезапуска.
     Раз в 20 с (и сразу при старте) читаем новые сообщения канала и обрабатываем те, что не видели.
     """
-    if not state.d.get("last_msg_id"):
-        known = [int(k) for k in list(state.signals) + list(state.d.get("msg2sig", {})) if str(k).isdigit()]
-        state.d["last_msg_id"] = max(known) if known else 0
-        if not state.d["last_msg_id"]:
+    st = OUR_STATE
+    if not st.d.get("last_msg_id"):
+        known = [int(k) for k in list(st.signals) + list(st.d.get("msg2sig", {})) if str(k).isdigit()]
+        st.d["last_msg_id"] = max(known) if known else 0
+        if not st.d["last_msg_id"]:
             last = await client.get_messages(channel_entity, limit=1)
-            state.d["last_msg_id"] = last[0].id if last else 0
-        state.save()
+            st.d["last_msg_id"] = last[0].id if last else 0
+        st.save()
     while True:
         try:
-            new = await client.get_messages(channel_entity, min_id=state.d["last_msg_id"], limit=50)
+            new = await client.get_messages(channel_entity, min_id=st.d["last_msg_id"], limit=50)
             for m in sorted(new, key=lambda x: x.id):
                 if not _seen(m.id):
                     await process_channel_message(m, late=True)
@@ -1193,15 +1406,15 @@ async def poll_channel():
 async def find_channel():
     """Ищет канал. Сначала по запомненному ID, затем по названию. None — если доступа ещё нет."""
     want = str(CFG["telegram"]["channel"]).strip()
-    pinned = state.d.get("channel_id")
+    pinned = OUR_STATE.d.get("channel_id")
     async for d in client.iter_dialogs():
         if not d.is_channel:
             continue
         if pinned and d.id == pinned:
             return d.entity
         if not pinned and ((want.lstrip("-").isdigit() and str(d.id) == want) or want.lower() in (d.name or "").lower()):
-            state.d["channel_id"] = d.id
-            state.save()
+            OUR_STATE.d["channel_id"] = d.id
+            OUR_STATE.save()
             return d.entity
     return None
 
@@ -1236,7 +1449,8 @@ async def main():
             await notify("Копировщик ещё ждёт доступа к каналу. Команды заработают после этого.")
             return
         log.info("команда владельца: %s", event.raw_text[:100])
-        await handle_user_command(event.pattern_match.group(1), event.raw_text.split(maxsplit=1)[1] if len(event.raw_text.split()) > 1 else "")
+        async with LOCK:
+            await handle_user_command(event.pattern_match.group(1), event.raw_text.split(maxsplit=1)[1] if len(event.raw_text.split()) > 1 else "")
 
     if bot:
         await bot.start(bot_token=BOT_TOKEN)
@@ -1257,7 +1471,9 @@ async def main():
                 return
             _, action, sid = event.data.decode().split(":", 2)
             try:
-                ans = await resolve_hold(action, sid if sid != "0" else "")
+                async with LOCK:
+                    with maybe_use(PROFILES[0] if PROFILES else None):
+                        ans = await resolve_hold(action, sid if sid != "0" else "")
             except Exception as e:
                 log.exception("ошибка кнопки")
                 ans = f"Ошибка: {e}"
@@ -1302,7 +1518,13 @@ async def main():
     trader = Trader(CFG, link)
     acc, is_demo = trader.connect()
     mt5_ok = True
-    TR = TrendBot(CFG, trader, notify, now_msk, make_buttons=trend_buttons)
+    TR = TrendBot(CFG, trader, notify_plain, now_msk, make_buttons=trend_buttons)
+    PROFILES.clear()
+    PROFILES.append(Profile("our", "🔵 Наши правила", CFG, trader, state, JOURNAL))
+    if (CFG.get("curator_profile") or {}).get("enabled", True):
+        cfg_c = curator_cfg(CFG)
+        PROFILES.append(Profile("cur", "🟠 Строго по куратору", cfg_c, Trader(cfg_c, link),
+                                State("state_cur.json"), "journal_cur.jsonl"))
     warn = "" if trader.trade_allowed() else "\n⚠️ В терминале выключена алготорговля (Algo Trading) — ордера не пройдут!"
     await notify(f"🚀 Копировщик запущен\n\n"
                  f"Режим: {MODE}{' (только разбор, без ордеров)' if DRY else ''}\n"
@@ -1310,7 +1532,8 @@ async def main():
                  f"Счёт {acc.login} ({'демо' if is_demo else 'РЕАЛЬНЫЙ'})\n"
                  f"Баланс {acc.balance:.2f} {acc.currency}{warn}\n\n"
                  f"{rules_text()}\n\n"
-                 f"Точка входа: /entry buy 20, /entry sell 80\n/help — все команды")
+                 + (f"{curator_rules_text()}\n\n" if len(PROFILES) > 1 else "")
+                 + "Точка входа: /entry buy 20, /entry sell 80\n/help — все команды")
 
     @client.on(events.NewMessage(chats=channel_entity))
     async def on_new(event):
@@ -1319,7 +1542,10 @@ async def main():
     @client.on(events.MessageEdited(chats=channel_entity))
     async def on_edit(event):
         try:
-            await handle_edit(event.message)
+            async with LOCK:
+                for p in profiles():
+                    with maybe_use(p):
+                        await handle_edit(event.message)
         except Exception as e:
             log.exception("ошибка правки")
             await notify(f"⚠️ Ошибка при обработке правки #{event.message.id}: {e}")

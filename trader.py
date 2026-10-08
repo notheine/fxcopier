@@ -118,6 +118,7 @@ class Trader:
         self.cfg = cfg
         self.mt5 = link
         self.magic = int(cfg.get("magic", 770077))
+        self.tag = str(cfg.get("comment_tag", "WW"))   # комментарий ордера: WW<сигнал>-<тейк> (куратор — WC)
         self._symbols = {}
 
     # ---- подключение
@@ -406,7 +407,7 @@ class Trader:
             sl = self._norm(info, plan.get("sl_k", {}).get(k, sig.sl))
             tp = self._norm(info, sig.tps[k])
             if action == "market":
-                ok, res, err, req, vsl, vtp = self._market(name, info, buy, vol, sl, tp, f"WW{sid}-{k}",
+                ok, res, err, req, vsl, vtp = self._market(name, info, buy, vol, sl, tp, f"{self.tag}{sid}-{k}",
                                                            sc.get("max_slippage", 0.5))
                 if ok:
                     o = {"ticket": int(res.order), "k": k, "kind": "market", "volume": vol,
@@ -434,7 +435,7 @@ class Trader:
             bsl, btp, vsl, vtp = self._fit(info, buy, price, sl, tp)
             req = {
                 "symbol": name, "volume": float(vol), "sl": bsl, "tp": btp, "magic": self.magic,
-                "comment": f"WW{sid}-{k}", "type_time": self.mt5.ORDER_TIME_GTC,
+                "comment": f"{self.tag}{sid}-{k}", "type_time": self.mt5.ORDER_TIME_GTC,
                 "action": self.mt5.TRADE_ACTION_PENDING,
                 "type": ((self.mt5.ORDER_TYPE_BUY_LIMIT if buy else self.mt5.ORDER_TYPE_SELL_LIMIT)
                          if action == "limit" else
@@ -524,7 +525,7 @@ class Trader:
                 continue
             o["state"] = "done"
             ok, res, err, req, vsl, vtp = self._market(name, info, buy, o["volume"], o["sl"], o["tp"],
-                                                       f"WW{rec['id']}-{o['k']}", sc.get("max_slippage", 0.5))
+                                                       f"{self.tag}{rec['id']}-{o['k']}", sc.get("max_slippage", 0.5))
             if ok:
                 n = {"ticket": int(res.order), "k": o["k"], "kind": "market", "volume": o["volume"],
                      "price": float(res.price or req["price"]), "via": o["kind"]}
@@ -580,7 +581,7 @@ class Trader:
     # ---- поиск своих позиций/ордеров
     def positions_of(self, rec):
         tickets = {o["ticket"] for o in rec.get("orders", [])}
-        pref = f"WW{rec['id']}-"
+        pref = f"{self.tag}{rec['id']}-"
         res = []
         for p in self.mt5.positions_get():
             if p.magic == self.magic and (int(p.identifier) in tickets or str(p.comment).startswith(pref)):
@@ -589,14 +590,14 @@ class Trader:
 
     def pending_of(self, rec):
         tickets = {o["ticket"] for o in rec.get("orders", [])}
-        pref = f"WW{rec['id']}-"
+        pref = f"{self.tag}{rec['id']}-"
         res = [o for o in self.mt5.orders_get()
                if o.magic == self.magic and (int(o.ticket) in tickets or str(o.comment).startswith(pref))]
         for d in rec.get("orders", []):          # виртуальные лимитки (брокер не дал поставить близко к цене)
             if d["kind"].startswith("v") and d.get("state") == "wait":
                 res.append(SimpleNamespace(ticket=d["ticket"], symbol=rec.get("symbol"), price_open=d["price"],
                                            volume_current=d["volume"], sl=d["sl"], tp=d["tp"], magic=self.magic,
-                                           comment=f"WW{rec['id']}-{d['k']}", virtual=d))
+                                           comment=f"{self.tag}{rec['id']}-{d['k']}", virtual=d))
         return res
 
     def k_of(self, rec, ticket_or_identifier, comment=""):

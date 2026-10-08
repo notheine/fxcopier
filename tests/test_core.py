@@ -66,7 +66,7 @@ def test_entry():
 def test_lots():
     assert lot_from_table(1000, [[200, .01], [900, .05], [1500, .06]]) == .05
     assert plan_positions(0.05, [1, 2, 3], 0.01, 0.01) == [(1, .01), (2, .01), (3, .01)]
-    assert plan_positions(0.025, [1, 2, 3], 0.01, 0.01) == [(1, .01), (3, .01)]
+    assert plan_positions(0.025, [1, 2, 3], 0.01, 0.01) == [(1, .01), (2, .01)]   # 08.10: TP1+TP2
 
 
 def test_channel_priority():
@@ -118,9 +118,9 @@ def test_after_tp1():
     kinds = sorted((o["k"], o["kind"]) for o in orders)
     assert kinds == [(1, "limit"), (2, "market"), (3, "market")], kinds
     assert [o.price_open for o in f.orders_get()] == [4400.0]
-    lot_cfg = {**cfg, "fixed_total_lot": 0.025}        # половинный лот: позиции TP1 (лимитка) и TP3, БУ — у TP2
+    lot_cfg = {**cfg, "fixed_total_lot": 0.025}        # половинный лот: позиции TP1 (лимитка) и TP2 (08.10), БУ — у TP2
     plan, why = Trader(lot_cfg, f).prepare(4, sig)
-    assert [k for k, _ in plan["positions"]] == [1, 3] and plan["be_k"] == 2, (plan["positions"], plan["be_k"])
+    assert [k for k, _ in plan["positions"]] == [1, 2] and plan["be_k"] == 2, (plan["positions"], plan["be_k"])
     cfg["risk"]["after_tp1"] = "skip"
     assert Trader(cfg, f).prepare(2, sig)[0] is None
     f.bid = 4415.0                                     # прошла и TP2 — остаётся только TP3

@@ -53,6 +53,16 @@ if E.get('SPLIT') in ('fill1','fill2','fill3'):
             i+=1
         return [(k,vol[k]) for k,_ in r]
     TR.plan_positions=_pp2
+if E.get('PAIR'):
+    # лот хватает только на 2 позиции (÷2 «занижаем риск»): какие тейки брать — PAIR=13 (как в коде), 12 или 23
+    _pp0=TR.plan_positions
+    pk=[int(x) for x in E['PAIR']]
+    def _pp3(total,keys,vmin,vstep):
+        r=_pp0(total,keys,vmin,vstep)
+        ks=[k for k in (1,2,3) if k in keys]
+        if len(r)==2 and len(ks)==3: return [(pk[0],r[0][1]),(pk[1],r[1][1])]
+        return r
+    TR.plan_positions=_pp3
 if E.get('BUYX') or E.get('SELLX'):
     _lt=TR.Trader.lot_total
     def _lt2(self,sig):

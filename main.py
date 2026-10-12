@@ -1439,9 +1439,36 @@ async def wait_for_channel():
             return ch
 
 
+async def telegram_logged_out():
+    """
+    Сессию Telegram-аккаунта копировщика завершили (12.10: AuthKeyUnregistered — копировщик падал и перезапускался,
+    владелец ничего не знал). Предупреждаем через бота (не чаще раза в 6 ч), ждём 10 мин и выходим —
+    systemd перезапустит и проверит снова. Вход заново — на сервере `fx-relogin` (QR).
+    """
+    log.error("Telegram-аккаунт копировщика не авторизован — нужен повторный вход (fx-relogin)")
+    last = float(OUR_STATE.d.get("logged_out_alert") or 0)
+    if time.time() - last > 6 * 3600:
+        try:
+            if bot:
+                await bot.start(bot_token=BOT_TOKEN)
+            await notify_plain("🚨 Копировщик НЕ видит канал\n\n"
+                               "Telegram-аккаунт копировщика вышел из системы (сессию завершили).\n"
+                               "Новые сигналы не обрабатываются. Открытые сделки защищены стопами у брокера.\n\n"
+                               "Нужен повторный вход по QR-коду — напишите Claude: «перелогинь копировщик».")
+            OUR_STATE.d["logged_out_alert"] = time.time()
+            OUR_STATE.save()
+        except Exception as e:
+            log.error("не удалось предупредить о выходе из Telegram: %s", e)
+    await asyncio.sleep(600)
+
+
 async def main():
     global link, trader, channel_entity, mt5_ok, TR
     global notify_peer
+    await client.connect()
+    if not await client.is_user_authorized():
+        await telegram_logged_out()
+        return
     await client.start()
 
     async def on_cmd(event):
@@ -1557,5 +1584,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    with client:
+    try:
         client.loop.run_until_complete(main())
+    finally:
+        client.loop.run_until_complete(client.disconnect())
+    sys.exit(1)   # сюда попадаем, только если связь с Telegram потеряна или аккаунт не авторизован — systemd перезапустит

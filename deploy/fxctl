@@ -3,6 +3,7 @@
 #   fxctl setup       — ввести данные (счёт MT5 + Telegram) и запустить
 #   fxctl mt5         — только счёт MT5 (без Telegram) и запуск терминала
 #   fxctl tg          — вход в Telegram по QR-коду и запуск копировщика
+#   fxctl relogin     — повторный вход в Telegram по QR (если сессию завершили), без вопросов про api_id
 #   fxctl bot <user>  — создать бота и группу для отчётов (user — ваш основной username)
 #   fxctl test        — тестовые позиции по последнему сигналу (только демо)
 #   fxctl test-status — показать тестовые позиции
@@ -99,6 +100,12 @@ bot)
 mt5)
   need_root; ensure_cfg; setup_mt5; start_mt5
   echo "Терминал MT5 запущен. Проверка сделкой:  fxctl test" ;;
+relogin)
+  need_root
+  systemctl stop fx-copier
+  cd $DST && sudo -u $APP_USER $DST/venv/bin/python tg_login.py
+  echo; echo "Запускаю копировщик…"; systemctl start fx-copier; sleep 30
+  systemctl is-active fx-copier >/dev/null && echo "✅ Готово. Можно закрыть это окно." ;;
 test)
   bridge_up || start_mt5
   run_py test_trade.py open ;;

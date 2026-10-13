@@ -879,6 +879,8 @@ async def check_signal(rec):
         await notify(f"⚙️ Сигнал #{rec['id']}:\n" + "\n".join("• " + m for m in vmsgs))
     pos = trader.positions_of(rec)
     pend = trader.pending_of(rec)
+    if not pos and not pend and still_open_by_deals(rec):
+        return          # позиция есть по сделкам, но MT5 её ещё не показал — проверим в следующий раз
     if not pos and not pend:
         rec["status"] = "closed"
         filled = any(o["kind"] == "market" for o in rec["orders"]) or rec.get("filled")
@@ -968,6 +970,29 @@ async def check_signal(rec):
                 rec["status"] = "closed"
             state.save()
             await notify(f"⌛️ Сигнал #{rec['id']}: {why} — снимаю ордера\n" + "\n".join("• " + l for l in res))
+
+
+def still_open_by_deals(rec):
+    """
+    По истории сделок у сигнала есть позиция с входом, но без полного выхода. 12.10 #1378: сразу после исполнения
+    лимитки MT5 на мгновение не показал ни ордер, ни позицию — запись закрылась через 40 с, а позиции остались без
+    присмотра (без безубытка и команд канала). Теперь в таком случае запись не закрываем.
+    """
+    try:
+        ids = {o["ticket"] for o in rec["orders"] if o.get("kind") in ("market", "limit", "stop")}
+        if not ids:
+            return False
+        left = {}
+        for d in trader.mt5.history_deals_get(rec["created"] - 3600, time.time() + 86400) or []:
+            pid = int(d.position_id)
+            if pid in ids and hasattr(d, "entry") and hasattr(d, "volume"):
+                left[pid] = left.get(pid, 0.0) + (float(d.volume) if int(d.entry) == 0 else -float(d.volume))
+        if any(v > 1e-6 for v in left.values()):
+            log.warning("сигнал #%s: позиции есть по сделкам, но не видны в MT5 — запись не закрываю", rec["id"])
+            return True
+    except Exception as e:
+        log.warning("проверка сделок сигнала #%s: %s", rec.get("id"), e)
+    return False
 
 
 def in_zone(rec, bid, ask):

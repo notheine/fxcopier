@@ -7,7 +7,11 @@
 - Сервер: `/home/fx/data/` — `channel.json`, `gold_m5.csv` (с 25.05), `gold_m1.csv` (последние ~3.5 мес), `bt/` (готовая папка для прогонов).
 - Копия у владельца на Mac: `~/FxCopier/_diag/`. Итоги и таблица сигналов — в документах проекта Claude «Fx»
   (`README_данные_и_прогоны.md`, `signals.csv`, `channel_messages.jsonl`, отчёты прогонов).
-- Обновить: `fetch_channel.py`, `fetch_prices.py` (см. шапки файлов), затем `prepare_data.py`.
+- С 14.10 данные копит еженедельная проверка правил (`tools/weekly/rules_check.py`): `channel_all.json` (все сообщения,
+  из `channel_log.jsonl` копировщика), `gold_m1_all.csv` (M1 копится), готовая папка для прогонов — `weekly/bt/`
+  (`ch.json`, `gold_hybrid.csv`, `config.yaml` как на сервере без секретов), прогоны — `weekly/runs/r_<вариант>/`.
+- Обновить вручную: `fetch_prices.py`, затем `prepare_data.py`. **`fetch_channel.py` не запускать** (копия Telegram-сессии;
+  12.10 сессию копировщика завершили, возможная причина — второе подключение) — сообщения брать из `channel_all.json`.
 
 ## Запуск
 ```
@@ -15,7 +19,7 @@ python3 -m venv venv && venv/bin/pip install telethon pyyaml tzdata
 DATA=/путь/bt PY=venv/bin/python tools/backtest/run.sh BASE
 DATA=/путь/bt PY=venv/bin/python tools/backtest/run.sh S2 CHASE_SELL=2
 ```
-Переменные: `SYM` (GOLD | BTC; для BTC — `btc_hybrid.csv`, стопы брокера не ближе $200, `BTCRISK` % риска), `CH` (файл сообщений), `START`, `END` (2026-5-27), `BAL` (1000), `COMM` ($ за лот за круг, 8), `ELB`/`ELS` (точка входа 0..1),
+Переменные: `PROFILE=cur` (только «строго по куратору», как профиль на сервере), `SYM` (GOLD | BTC; для BTC — `btc_hybrid.csv`, стопы брокера не ближе $200, `BTCRISK` % риска), `CH` (файл сообщений), `START`, `END` (2026-5-27), `BAL` (1000), `COMM` ($ за лот за круг, 8), `ELB`/`ELS` (точка входа 0..1),
 `LOTX`, `SPLIT` (fill1/fill2/fill3 — полный лот по таблице), `BENEAR` (ранний БУ), `BEOFF`, `AUTOBE=0`, `BEK2=1` (БУ на TP2), `HALVE=0`, `BUYX`/`SELLX`, `MAXACT`, `EXP` (мин), `CHASE_BUY`/`CHASE_SELL` (правило куратора №4 — работают только с trader.py из коммита 85c7323, в основном коде правила нет). Другие настройки — правкой `config.yaml` в папке данных.
 Один прогон ≈ 4 мин на 1 ядре; варианты можно запускать параллельно (каждый в своей `r_TAG`).
 Защита (guard) и вопросы кнопками выключены — считается, что владелец жмёт «входить».

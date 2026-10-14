@@ -1,0 +1,12 @@
+[Unit]
+Description=FxCopier: weekly rules check on channel history (report to the Telegram group)
+After=fx-bridge.service network-online.target
+
+[Service]
+Type=oneshot
+User=fx
+WorkingDirectory=/home/fx/copier
+ExecStart=/home/fx/copier/venv/bin/python tools/weekly/rules_check.py
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=6h

@@ -230,8 +230,11 @@ RestartSec=20
 WantedBy=multi-user.target
 EOF
 
+install -m 644 $DST/deploy/fx-weekly.service $DST/deploy/fx-weekly.timer /etc/systemd/system/   # проверка правил по субботам
+
 systemctl daemon-reload
 systemctl enable --now fx-xvfb.service
+systemctl enable fx-weekly.timer
 
 echo
 echo "Готово. Дальше:  fxctl setup   (ввести данные Telegram и счёта MT5)"

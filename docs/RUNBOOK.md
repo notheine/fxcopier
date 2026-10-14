@@ -6,7 +6,13 @@
 `/status`, `/entry`, `/report`, `/report week`, `/report month`, `/pause`, `/resume`, `/closeall`, `/help`.
 `/entry 30` — точка входа в диапазоне сигнала (0 — лучший край, 100 — худший; сейчас 50).
 
-На сервере: `fxctl status`, `fxctl logs`, `fxctl restart`, `fxctl mode …`.
+На сервере: `fxctl status`, `fxctl logs`, `fxctl restart`, `fxctl mode …`, `fxctl check` (проверка правил сейчас).
+
+По субботам в 10:00 МСК в группу приходит **«🗓 Проверка правил»** (≈1 ч счёта в фоне, см. ARCHITECTURE.md):
+реальный счёт за неделю и месяц, прогон истории (в среднем в месяц / последний месяц / неделя) для наших правил
+и куратора, и по каждому нашему правилу ✅ помогает / ➖ без разницы / ⚠️ мешает за последний месяц.
+⚠️ — повод обсудить с Claude («разбери проверку правил»); сама проверка настройки не меняет.
+Не пришла — `journalctl -u fx-weekly -n 50`, `systemctl list-timers fx-weekly.timer`.
 Логи: `/home/fx/copier/logs/copier.log`, `journalctl -u fx-mt5 -u fx-bridge -u fx-copier`.
 Журнал терминала: `/home/fx/.wine/drive_c/Program Files/FxPro Markets MT5/logs/<дата>.log` (UTF-16: `iconv -c -f UTF-16LE -t UTF-8`).
 

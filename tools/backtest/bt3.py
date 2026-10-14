@@ -1,7 +1,7 @@
 """Прогон истории канала через настоящий main.py + FakeMT5 на минутных свечах FxPro.
 Запуск — через run.sh (папка с копией кода, config.yaml, ch.json, gold_hybrid.csv):
   CHASE_SELL=1 CHASE_BUY= START=2026-5-27 END=2026-10-8 python bt3.py
-Переменные: ELB/ELS — точка входа покупок/продаж (0..1), CHASE_BUY/CHASE_SELL — chase_usd_*, COMM — $ за лот за круг."""
+Переменные: PROFILE=cur — строго по куратору; ELB/ELS — точка входа покупок/продаж (0..1), CHASE_BUY/CHASE_SELL — chase_usd_*, COMM — $ за лот за круг."""
 import asyncio, csv, json, os, datetime as dt, collections, traceback
 from types import SimpleNamespace as NS
 from zoneinfo import ZoneInfo
@@ -20,6 +20,8 @@ OUT=[]
 async def notify(t, buttons=None, alt=""): OUT.append((CLOCK[0],t))
 main.notify=notify
 cfg=main.CFG
+if E.get('PROFILE')=='cur':   # только профиль «строго по куратору» (как на сервере, но на отдельном счёте)
+    _c=main.curator_cfg(cfg); cfg.clear(); cfg.update(_c)
 cfg['guard']={'enabled':False}
 SYM=E.get('SYM','GOLD')            # GOLD | BTC
 if SYM=='BTC':

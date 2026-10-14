@@ -183,7 +183,15 @@ def rules_text():
               "rest": "• Цена уже прошла TP1 → TP2 и TP3 по рынку (куратор)",
               "rest_limit": "• Цена уже прошла TP1 → TP2 и TP3 по рынку, TP1 лимиткой"}.get(after, f"• after_tp1: {after}"))
     if mg.get("auto_be_after_tp1", True):
-        L.append(f"• Цена дошла до TP1 → стоп остальных позиций в безубыток (+${gold.get('be_offset', 0):g})")
+        near, frac = float(mg.get("be_near_tp1_usd", 0) or 0), float(mg.get("be_at_frac", 0) or 0)
+        if near:
+            L.append(f"• Ранний безубыток: до TP1 осталось ${near:g} → стоп всех позиций в безубыток "
+                     f"(+${gold.get('be_offset', 0):g})")
+        elif frac:
+            L.append(f"• Ранний безубыток: цена прошла {frac * 100:.0f}% пути до TP1 → стоп в безубыток "
+                     f"(+${gold.get('be_offset', 0):g})")
+        else:
+            L.append(f"• Цена дошла до TP1 → стоп остальных позиций в безубыток (+${gold.get('be_offset', 0):g})")
     sl_rule = rk.get("sl_rule", "none") or "none"
     if sl_rule != "none":                                  # стоп/тейки и лот по таблице — само собой, не пишем
         L.append(f"• Стоп относительно тейков: {sl_rule}")
@@ -902,6 +910,7 @@ async def check_signal(rec):
     tp1 = min(rec["tps"].items(), key=lambda kv: int(kv[0]))[1]
     buy = rec["side"] == "BUY"
     reached = (bid >= tp1) if buy else (ask <= tp1)
+    early = False                             # ранний безубыток (be_near_tp1_usd / be_at_frac)
     if rec.get("be_k"):                       # вошли, когда TP1 уже был пройден — безубыток от нашего первого тейка
         tp_be = rec["tps"].get(str(rec["be_k"]), tp1)
         reached_be = (bid >= tp_be) if buy else (ask <= tp_be)
@@ -915,6 +924,7 @@ async def check_signal(rec):
             cur = bid if buy else ask
             lvl = (tp1 - near if buy else tp1 + near) if near else e + frac * (tp1 - e)
             reached_be = (cur >= lvl and lvl > e) if buy else (cur <= lvl and lvl < e)
+            early = reached_be
 
     if (pos and not rec["be_done"] and reached_be and not rec.get("no_auto_be")
             and CFG["management"].get("auto_be_after_tp1", True)):
@@ -922,7 +932,9 @@ async def check_signal(rec):
         res = trader.move_to_be(rec)
         state.save()
         if res:
-            await notify(f"🔒 Сигнал #{rec['id']}: цена дошла до {'TP' + str(rec['be_k']) if rec.get('be_k') else 'TP1'} {tp_be:g} → стоп в безубыток\n"
+            what = (f"ранний безубыток: цена почти у TP1 {tp_be:g}" if early else
+                    f"цена дошла до {'TP' + str(rec['be_k']) if rec.get('be_k') else 'TP1'} {tp_be:g}")
+            await notify(f"🔒 Сигнал #{rec['id']}: {what} → стоп в безубыток\n"
                          + "\n".join("• " + l for l in res))
 
     if pend and pos and reached and not rec.get("be_k"):
@@ -1364,6 +1376,22 @@ def _mark_seen(mid):
     OUR_STATE.save()
 
 
+def channel_archive(msg, edit=False):
+    """Каждое сообщение канала (и правка) — строкой в channel_log.jsonl: история для еженедельной проверки правил
+    (tools/weekly/rules_check.py) без второго подключения к Telegram. Формат как у channel.json: id, ts (UTC), text, reply."""
+    try:
+        rt = getattr(msg, "reply_to", None)
+        d = getattr(msg, "date", None)
+        rec = {"id": msg.id, "ts": int(d.timestamp()) if d else int(time.time()), "text": msg.message or "",
+               "reply": getattr(rt, "reply_to_msg_id", None) if rt else None}
+        if edit:
+            rec["edit"] = True
+        with open(os.path.join(BASE, "channel_log.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        log.exception("channel_log.jsonl")
+
+
 async def process_channel_message(msg, late=False):
     """Сообщение канала (из события или догнанное опросом). Каждое обрабатывается один раз."""
     async with LOCK:
@@ -1376,6 +1404,7 @@ async def _process_channel_message(msg, late=False):
     _mark_seen(msg.id)
     text = msg.message or ""
     log.info("канал #%s%s: %s", msg.id, " (догнал опросом)" if late else "", text.replace("\n", " | ")[:300])
+    channel_archive(msg)
     try:
         sig = parse_signal(text, **CFG.get("sanity", {}))
         if sig:
@@ -1593,6 +1622,7 @@ async def main():
 
     @client.on(events.MessageEdited(chats=channel_entity))
     async def on_edit(event):
+        channel_archive(event.message, edit=True)
         try:
             async with LOCK:
                 for p in profiles():

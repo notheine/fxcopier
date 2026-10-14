@@ -46,4 +46,5 @@ ssh root@<IP> fxctl mode demo        # торговля на демо
 ```bash
 python tests/test_core.py
 python tests/test_trend.py
+python tests/test_weekly.py
 ```

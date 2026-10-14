@@ -15,6 +15,7 @@
 #   fxctl logs        — журнал копировщика (выход: Ctrl+C)
 #   fxctl mode dry_run|demo|live — сменить режим и перезапустить
 #   fxctl vnc         — показать экран MT5 (через SSH-туннель)
+#   fxctl check       — проверка правил на истории канала сейчас (сама — по субботам 10:00 МСК), отчёт в группу
 set -euo pipefail
 APP_USER=fx
 DST=/home/$APP_USER/copier
@@ -41,6 +42,10 @@ need_root() { [ "$(id -u)" = 0 ] || { echo "запускайте от root"; exi
 ensure_cfg() { [ -f $DST/config.yaml ] || sudo -u $APP_USER cp $DST/config.example.yaml $DST/config.yaml; }
 run_py() { cd $DST && sudo -u $APP_USER $DST/venv/bin/python "$@"; }
 bridge_up() { (echo > /dev/tcp/127.0.0.1/18812) 2>/dev/null; }
+weekly_install() {   # еженедельная проверка правил: служба + таймер (суббота 10:00 МСК)
+  install -m 644 $DST/deploy/fx-weekly.service $DST/deploy/fx-weekly.timer /etc/systemd/system/
+  systemctl daemon-reload; systemctl enable --now fx-weekly.timer >/dev/null 2>&1
+}
 
 setup_mt5() {
   echo "== Счёт MT5 (сначала ДЕМО)"
@@ -130,5 +135,10 @@ vnc)
   echo "  ssh -L 5900:localhost:5900 root@<IP_сервера>"
   echo "и затем Finder → Переход → Подключение к серверу → vnc://localhost:5900   (Ctrl+C здесь — закрыть)"
   sudo -u $APP_USER x11vnc -display :99 -localhost -nopw -forever -quiet ;;
-*) sed -n '2,16p' "$0" ;;
+check)
+  need_root; weekly_install
+  systemctl start --no-block fx-weekly
+  echo "Проверка правил запущена (≈1 час, тихо в фоне). Отчёт придёт в группу."
+  echo "Ход: journalctl -u fx-weekly -f   (выход: Ctrl+C, проверка продолжится)" ;;
+*) sed -n '2,18p' "$0" ;;
 esac

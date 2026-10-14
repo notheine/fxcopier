@@ -60,13 +60,14 @@ def verdict(with_rule, without_rule, same=SAME):
 
 def real_results(deals, balance_now, now_srv, days):
     """Реальный счёт за последние days дней. deals — [(время сервера, тип, magic, сумма с комиссией и свопом)].
-    % — к балансу на начало периода (пополнения и снятия учтены)."""
+    % — к деньгам на счёте в начале периода плюс пополнения за период (счёт открыт меньше месяца назад —
+    к первому пополнению): баланс сейчас минус результат всех сделок за период, включая ручные."""
     cut = now_srv - days * 86400
-    period = [d for d in deals if d[0] >= cut]
-    base = balance_now - sum(d[3] for d in period)
+    trades = [d for d in deals if d[0] >= cut and d[1] in (0, 1)]
+    base = balance_now - sum(d[3] for d in trades)
     out = {}
     for magic, _ in MAGICS:
-        pnl = sum(d[3] for d in period if d[2] == magic and d[1] in (0, 1))
+        pnl = sum(d[3] for d in trades if d[2] == magic)
         out[magic] = (round(pnl, 2), round(pnl / base * 100, 1) if base > 0 else 0.0)
     return out
 

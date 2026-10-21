@@ -213,7 +213,10 @@ def rules_text():
     if CFG.get("weekend", {}).get("enabled"):
         L.append("• Пятница вечером → закрываю всё на выходные")
     if CFG.get("guard", {}).get("enabled", True):
-        L.append("• Защита: опасная сделка → пауза и кнопки в группе")
+        g = G.settings(CFG)
+        L.append(f"• Защита: опасная сделка → спрашиваю кнопками, без ответа {g['approval_ttl_min']:g} мин — пропускаю")
+        L.append(f"• Просадка {g['max_drawdown_pct']:g}% или {g['max_losses_in_row']} убытка подряд по нашим сделкам → "
+                 f"пауза, без ответа {g.get('account_pause_max_min', 30):g} мин — продолжаю")
     if TR and TR.rules_line():
         L.append(TR.rules_line())
     if state.d.get("paused"):
@@ -275,7 +278,10 @@ def entries_blocked(symbol_key=None):
     """Причина, по которой новые входы запрещены, или None. symbol_key — для выходных (биткоин торгуется и в них)."""
     h = state.d.get("hold")
     if h and h.get("type") in ("trade", "account") and not h.get("ask"):
-        return "защита ждёт вашего решения (кнопки в группе)"
+        g = G.settings(CFG)
+        left = (g["approval_ttl_min"] if h["type"] == "trade" else g.get("account_pause_max_min", 30)) * 60 \
+            - (time.time() - h["created"])
+        return f"защита ждёт вашего решения (без ответа — сам продолжу через {max(1, left / 60):.0f} мин)"
     if state.d["paused"]:
         return "копировщик на паузе (/resume чтобы продолжить)"
     if state.d["day_paused"]:
@@ -364,7 +370,12 @@ async def handle_signal(msg, text, sig, late=False):
         rec["reason"] = why.split(" —")[0].split(" (")[0]
         state.signals[sid] = rec
         state.save()
-        await notify(head + f"\n⏭ Пропускаю: {why}")
+        h = state.d.get("hold")
+        if h and why.startswith("защита") and h.get("type") == "account":   # кнопки — прямо здесь, а не где-то выше
+            await notify(head + f"\n⏭ Пропускаю: {why}", buttons=guard_buttons("account", 0),
+                         alt="Ответьте /resume — продолжить торговлю")
+        else:
+            await notify(head + f"\n⏭ Пропускаю: {why}")
         return
 
     entry_level(sig.side)          # настройка владельца (/entry) → CFG для trader.prepare
@@ -504,44 +515,88 @@ async def ask_trade(rec, plan, reasons, head):
         alt="Ответьте: /approve — открыть, /approve_safe — с безопасным лотом, /reject — пропустить")
 
 
+def own_drawdown_reset(balance=None):
+    """Новая точка отсчёта просадки профиля: текущий баланс счёта и текущий конец журнала."""
+    bal = trader.account().balance if balance is None else balance
+    state.d["dd_base"] = {"balance": bal, "n": len(journal_rows(0, 1e12))}
+    state.d["peak_own"] = bal
+    state.d["losses_ack"] = len(journal_rows(0, 1e12))
+
+
+def own_equity():
+    """«Баланс» и эквити профиля по его собственным сделкам: на одном счёте торгуют наши правила, куратор,
+    тренд-робот и ручные сделки — чужие убытки не должны ставить этот профиль на паузу (15.10: пауза наших
+    правил из-за убытков куратора и ручных сделок, 6 дней простоя)."""
+    if not state.d.get("dd_base"):
+        own_drawdown_reset()
+    b = state.d["dd_base"]
+    bal = b["balance"] + sum(r["pnl"] for r in journal_rows(0, 1e12)[b["n"]:])
+    try:
+        pos, _ = trader.all_own()
+        floating = sum(p.profit + getattr(p, "swap", 0) for p in pos)
+    except Exception:
+        floating = 0.0
+    return bal, bal + floating
+
+
+_ACC_CHECKED = {}     # профиль → время последней проверки просадки
+
+
 async def guard_account_check():
-    """Пауза по состоянию счёта: серия убытков, большая просадка. Плюс истечение вопросов по сделкам."""
+    """Пауза по состоянию счёта (серия убытков, большая просадка) и истечение всех вопросов защиты.
+    Решение владельца 21.10: без ответа ничего не стоит — каждый вопрос сам закрывается через несколько минут."""
     h = state.d.get("hold")
-    if h and h.get("ask") and time.time() - h["created"] > G.settings(CFG)["approval_ttl_min"] * 60:
-        rec = state.signals.get(str(h["sid"]))       # вопрос владельцу без ответа — просто пропускаем сигнал
+    g = G.settings(CFG)
+    ttl = g["approval_ttl_min"]
+    if h and h["type"] == "trade" and time.time() - h["created"] > ttl * 60:
+        rec = state.signals.get(str(h["sid"]))       # вопрос по сделке без ответа — пропускаем сигнал и работаем дальше
         if rec:
-            rec["status"], rec["reason"] = "skipped", "нет ответа на вопрос"
+            rec["status"] = "skipped"
+            rec["reason"] = "нет ответа на вопрос" if h.get("ask") else "нет ответа на вопрос защиты"
         state.d["hold"] = None
         state.save()
-        await notify(f"⌛️ Ответа по сигналу #{h['sid']} не было {G.settings(CFG)['approval_ttl_min']} мин — пропускаю.")
+        await notify(f"⌛️ Ответа по сигналу #{h['sid']} не было {ttl} мин — сделку не открываю. Работаю дальше.")
         return
-    if h and h["type"] == "trade" and time.time() - h["created"] > G.settings(CFG)["approval_ttl_min"] * 60:
-        rec = state.signals.get(str(h["sid"]))
-        if rec:
-            rec["status"], rec["reason"] = "skipped", "нет ответа на вопрос защиты"
-        state.d["hold"] = {"type": "account", "sid": 0, "created": time.time(),
-                           "reasons": [f"не было ответа по сигналу #{h['sid']}"]}
+    if h and h["type"] == "sl" and time.time() - h["created"] > ttl * 60:
+        rec = state.signals.get(str(h["sid"]))       # данные канала в приоритете: без ответа — стоп как просит канал
+        state.d["hold"] = None
         state.save()
-        await notify(f"⌛️ Ответа по сигналу #{h['sid']} не было {G.settings(CFG)['approval_ttl_min']} мин — "
-                     "сделку не открываю (цена устарела). Торговля на паузе до вашего решения.",
-                     buttons=guard_buttons("account", 0), alt="Ответьте /resume — продолжить торговлю")
+        lines = trader.set_sl(rec, h["price"]) if rec and rec.get("status") == "active" else []
+        if rec:
+            rec["sl_changed"] = True
+            state.save()
+        await notify(f"⌛️ Ответа не было {ttl} мин — стоп сигнала #{h['sid']} переношу на {h['price']:g}, "
+                     "как просит канал (данные канала в приоритете)"
+                     + ("\n" + "\n".join("• " + l for l in lines) if lines else ""))
+        return
+    pmax = float(g.get("account_pause_max_min", 30) or 0)
+    if h and h["type"] == "account" and pmax and time.time() - h["created"] > pmax * 60:
+        state.d["hold"] = None
+        own_drawdown_reset()
+        state.save()
+        await notify(f"▶️ Ответа на паузу защиты не было {pmax:g} мин — продолжаю торговлю.\n"
+                     f"Просадку и серию убытков считаю заново, от баланса {state.d['dd_base']['balance']:.2f}.")
         return
     if h or not trader:
         return
-    acc = trader.account()
-    peak = max(state.d.get("peak_balance") or 0, acc.balance)
-    if peak != state.d.get("peak_balance"):
-        state.d["peak_balance"] = peak
+    key = CUR.key if CUR else ""
+    if time.time() - _ACC_CHECKED.get(key, 0) < 10:     # просадку — раз в 10 с (опрос MT5 через мост не бесплатный)
+        return
+    _ACC_CHECKED[key] = time.time()
+    bal, eq = own_equity()
+    peak = max(state.d.get("peak_own") or 0, bal)
+    if peak != state.d.get("peak_own"):
+        state.d["peak_own"] = peak
         state.save()
     rows = journal_rows(0, 1e12)[state.d.get("losses_ack", 0):]
-    reasons = G.check_account(G.settings(CFG), last_pnls=[r["pnl"] for r in rows], equity=acc.equity,
-                              peak_balance=peak)
+    reasons = G.check_account(g, last_pnls=[r["pnl"] for r in rows], equity=eq, peak_balance=peak)
     if reasons:
+        acc = trader.account()
         state.d["hold"] = {"type": "account", "sid": 0, "reasons": reasons, "created": time.time()}
         state.save()
-        await notify("🛡 ЗАЩИТА: торговля на паузе\n• " + "\n• ".join(reasons)
-                     + f"\nБаланс {acc.balance:.2f}, эквити {acc.equity:.2f}. Открытые сделки веду дальше "
-                       "(стопы/тейки на месте). Новые сигналы — только после вашего решения.",
+        await notify("🛡 ЗАЩИТА: пауза в новых сигналах\n• " + "\n• ".join(reasons)
+                     + f"\nБаланс счёта {acc.balance:.2f}, эквити {acc.equity:.2f}. Открытые сделки веду дальше.\n\n"
+                       f"Нет ответа {pmax:g} мин — продолжу торговлю сам.",
                      buttons=guard_buttons("account", 0),
                      alt="Ответьте /resume — продолжить торговлю")
 
@@ -591,8 +646,7 @@ async def resolve_hold(action, sid=""):
         if action == "keep":
             state.d["paused"] = True
         state.d["hold"] = None
-        state.d["losses_ack"] = len(journal_rows(0, 1e12))
-        state.d["peak_balance"] = trader.account().balance
+        own_drawdown_reset()
         state.save()
         await notify("▶️ Продолжаю торговлю." if action == "resume" else
                      "⏸ Оставил на паузе. Продолжить: /resume")

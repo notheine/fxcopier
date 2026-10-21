@@ -342,7 +342,7 @@ class Trader:
             total = min(total, max_lot)
         positions = plan_positions(total, list(sig.tps), info.volume_min, info.volume_step)
         if not positions:
-            return None, f"лот {total:.3f} меньше минимального {info.volume_min} — пропускаю"
+            return None, f"лот {total:.4f} меньше минимального {info.volume_min:g} — пропускаю"
         if per_k:
             positions = [(k, v) for k, v in positions if per_k.get(k, ("x",))[0] != "skip"]
             if not any(per_k.get(k, (action,))[0] == action for k, _ in positions):

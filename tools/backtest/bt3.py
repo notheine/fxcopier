@@ -27,7 +27,7 @@ SYM=E.get('SYM','GOLD')            # GOLD | BTC
 if SYM=='BTC':
     cfg['symbols']['GOLD']['enabled']=False
     cfg['symbols']['BTC'].update(enabled=True, candidates=['BITCOIN'], weekend_trading=True, risk_pct=float(E.get('BTCRISK','4')))
-cfg['risk']['ask_risky_buy']=False
+if E.get('ASKNO')!='1': cfg['risk']['ask_risky_buy']=False   # ASKNO=1: вопросы кнопками как на сервере, ответа нет — пропуск
 for side in ('buy','sell'):
     v=E.get(f'CHASE_{side.upper()}','')
     if v!='': cfg['risk'][f'chase_usd_{side}']=float(v)
@@ -39,6 +39,15 @@ if E.get('AUTOBE')=='0': cfg['management']['auto_be_after_tp1']=False      # б�
 if E.get('BEOFF'): cfg['symbols']['GOLD']['be_offset']=float(E['BEOFF'])    # БУ «с запасом» $X
 if E.get('BENEAR'): cfg['management']['be_near_tp1_usd']=float(E['BENEAR']) # ранний БУ за $X до TP1
 if E.get('HALVE')=='0': cfg['halve_on_risky']=False
+if E.get('GOLDRISK'): cfg['symbols']['GOLD']['risk_pct']=float(E['GOLDRISK'])   # лот золота от риска: при стопе −X% баланса
+if E.get('MAXSL'):
+    # не входить, если стоп дальше $X от середины диапазона (длинный стоп — самые большие убытки)
+    _prep_sl=TR.Trader.prepare
+    def _prep_maxsl(self,sid,sig,max_lot=None):
+        if sig.symbol=='GOLD' and abs(sum(sig.zone)/2-sig.sl)>float(E['MAXSL']):
+            return None, f"стоп дальше ${E['MAXSL']} — не вхожу"
+        return _prep_sl(self,sid,sig,max_lot=max_lot)
+    TR.Trader.prepare=_prep_maxsl
 if E.get('SPLIT') in ('fill1','fill2','fill3'):
     # общий лот по таблице делится не поровну с округлением вниз (0.05 → 0.01×3), а полностью:
     # остаток по 0.01 раздаётся позициям в заданном порядке (fill1: TP1→TP2→TP3, fill3: TP3→TP2→TP1, fill2: TP2→TP3→TP1)
@@ -79,12 +88,26 @@ if E.get('BEK2')=='1':
         if plan and not plan.get('be_k') and 2 in sig.tps: plan['be_k']=2
         return plan,txt
     TR.Trader.prepare=_prep2
+if E.get('TRAIL2')=='1':
+    # цена дошла до TP2 → стоп оставшейся позиции (TP3) на TP1: прибыль не отдаём обратно в безубыток
+    _cs=main.check_signal
+    async def _cs2(rec):
+        await _cs(rec)
+        if rec.get('status')!='active' or rec.get('tr2') or '2' not in rec['tps']: return
+        bid,ask=main.trader.price(rec['symbol']); buy=rec['side']=='BUY'
+        tp1,tp2=rec['tps']['1'],rec['tps']['2']
+        if (bid>=tp2) if buy else (ask<=tp2):
+            if main.trader.positions_of(rec):
+                rec['tr2']=True; main.trader.set_sl(rec,tp1)
+    main.check_signal=_cs2
 f=FakeMT5(float(E.get('BAL','1000')))
 f.syms['BITCOIN']={'contract':1.0,'stops':int(E.get('BTCSTOPS','20000'))}   # FxPro: стопы не ближе $200
 COMM=float(E.get('COMM','8.0' if SYM=='GOLD' else '0'))
 _close=f._close
+DEALS=[]
 def close(p,px=None,why=''):
     _close(p,px,why); f.balance-=COMM*p.volume; f.deals[-1].commission=-COMM*p.volume
+    DEALS.append(dict(t=CLOCK[0],c=p.comment,v=p.volume,o=p.price_open,why=why,pnl=round(f.deals[-1].profit-COMM*p.volume,2)))
 f._close=close
 main.link=f; main.trader=TR.Trader(cfg,f); main.mt5_ok=True
 for fn in ("state_bt.json","journal.jsonl"):
@@ -117,7 +140,9 @@ async def resolve():
     h=main.state.d.get("hold")
     if h:
         HOLDS.append((CLOCK[0],h['type'],h.get('reasons')))
-        await main.resolve_hold({"trade":"ok","account":"resume","sl":"slok"}[h['type']])
+        act={"trade":"ok","account":"resume","sl":"slok"}[h['type']]
+        if E.get('ASKNO')=='1' and h.get('ask'): act="no"
+        await main.resolve_hold(act)
 async def handle(m):
     text=m['text'] or ''
     msg=NS(id=m['id'],message=text,date=dt.datetime.fromtimestamp(CLOCK[0]-3*3600,dt.timezone.utc),
@@ -171,4 +196,4 @@ if DUAL:
                         status=dict(collections.Counter(r['status'] for r in main.PROFILES[1].state.signals.values())))
 print(json.dumps(res,ensure_ascii=False))
 for e in ERR[:3]: print(e[-1500:])
-json.dump({'res':res,'eq':EQ,'journal':J,'signals':S,'notes':OUT},open(f"bt_{E.get('TAG','x')}.json",'w'),ensure_ascii=False)
+json.dump({'res':res,'eq':EQ,'journal':J,'signals':S,'notes':OUT,'deals':DEALS},open(f"bt_{E.get('TAG','x')}.json",'w'),ensure_ascii=False)

@@ -40,6 +40,14 @@ if E.get('BEOFF'): cfg['symbols']['GOLD']['be_offset']=float(E['BEOFF'])    # Б
 if E.get('BENEAR'): cfg['management']['be_near_tp1_usd']=float(E['BENEAR']) # ранний БУ за $X до TP1
 if E.get('HALVE')=='0': cfg['halve_on_risky']=False
 if E.get('GOLDRISK'): cfg['symbols']['GOLD']['risk_pct']=float(E['GOLDRISK'])   # лот золота от риска: при стопе −X% баланса
+if E.get('NOLIMIT')=='1':
+    # цена хуже точки входа (была бы лимитка) — не входить вовсе; лимитные сигналы канала (LIMIT) — как обычно
+    _prep_nl=TR.Trader.prepare
+    def _prep_nolimit(self,sid,sig,max_lot=None):
+        plan,txt=_prep_nl(self,sid,sig,max_lot=max_lot)
+        if plan and plan.get('action')=='limit' and not sig.is_limit: return None, 'цена хуже точки входа — не вхожу'
+        return plan,txt
+    TR.Trader.prepare=_prep_nolimit
 if E.get('MAXSL'):
     # не входить, если стоп дальше $X от середины диапазона (длинный стоп — самые большие убытки)
     _prep_sl=TR.Trader.prepare

@@ -242,8 +242,11 @@ class Trader:
         min_gap = max(spread * 2, sc.get("min_sl_gap", 0))
         rk = self.cfg.get("risk", {})
         level = float(rk.get(f"entry_level_{sig.side.lower()}", rk.get("entry_level", 0.5)))
-        mode = rk.get("entry_mode", "limit")          # limit — только в диапазоне (лимитка на точку); market — сразу по рынку
+        mode = rk.get("entry_mode", "limit")          # limit — только в диапазоне (лимитка на точку); market — сразу по рынку;
+                                                      # range — в диапазоне или лучше по рынку, хуже — пропуск (владелец 01.11)
         after = rk.get("after_tp1", "skip")           # TP1 уже пройден: skip | rest (TP2/TP3 по рынку) | rest_limit (+TP1 лимиткой)
+        if mode == "range":
+            after = "skip"                            # цена прошла TP1 — она хуже диапазона: пропуск
         buy = sig.side == "BUY"
         s_ = 1 if buy else -1
         cur = tick.ask if buy else tick.bid
@@ -265,6 +268,17 @@ class Trader:
                     per_k[k] = ("limit", e) if after == "rest_limit" else ("skip", None)
             if after == "rest_limit":
                 why += f", TP1 — BUY LIMIT {e:g}" if buy else f", TP1 — SELL LIMIT {e:g}"
+        elif mode == "range":
+            # правило владельца 01.11.2026 (единственное): цена в диапазоне сигнала или лучше — все позиции сразу по рынку;
+            # цена уже хуже диапазона — пропуск, лимитку не ставим (лимитки исполнялись, когда цена шла к стопу).
+            # Лимитный сигнал канала («LIMIT buy 4333») — лимитка на цену из сигнала, как просит канал.
+            lo_r, hi_r, _ = entry_price(sig, sc.get("entry_tolerance", 0), 0.0)
+            action, price, why = decide_entry(sig, tick.bid, tick.ask, sc.get("entry_tolerance", 0), min_gap,
+                                              level=0.5 if sig.is_limit else 1.0, below_market=not sig.is_limit)
+            if action == "limit" and not sig.is_limit:
+                action, price, why = "skip", None, f"цена {cur:g} хуже диапазона {lo_r:g}–{hi_r:g}"
+            elif action == "market":
+                why = f"цена {cur:g} в диапазоне {lo_r:g}–{hi_r:g} или лучше"
         elif mode == "ladder" and not sig.is_limit:
             # лесенка: у каждой позиции своя точка в диапазоне (по умолчанию TP1 — у худшего края,
             # TP2 — в середине, TP3 — у лучшего края); каждая — по рынку или лимиткой по общему правилу

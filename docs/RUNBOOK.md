@@ -3,8 +3,8 @@
 ## Ежедневное
 
 Всё приходит в группу «FxCopier — сделки» от бота. Команды там же:
-`/status`, `/entry`, `/report`, `/report week`, `/report month`, `/pause`, `/resume`, `/closeall`, `/help`.
-`/entry 30` — точка входа в диапазоне сигнала (0 — лучший край, 100 — худший; сейчас 50).
+`/status`, `/report`, `/report week`, `/report month`, `/pause`, `/resume`, `/closeall`, `/help`.
+С 01.11 одно правило входа (`entry_mode: range`): `/entry` не используется.
 
 На сервере: `fxctl status`, `fxctl logs`, `fxctl restart`, `fxctl mode …`, `fxctl check` (проверка правил сейчас).
 

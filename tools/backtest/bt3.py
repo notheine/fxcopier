@@ -34,8 +34,9 @@ for side in ('buy','sell'):
 # --- варианты для прогонов (только стенд, основной код не меняется) ---
 if E.get('LOTX'): cfg['lot_table']=[[b,round(l*float(E['LOTX']),2)] for b,l in cfg['lot_table']]   # лот ×X
 if E.get('MAXACT'): cfg['risk']['max_active_signals']=int(E['MAXACT'])
+if E.get('MODE'): cfg['risk']['entry_mode']=E['MODE']    # range — правило владельца 01.11 (в диапазоне по рынку, хуже — пропуск)
 if E.get('EXP'): cfg['risk']['pending_expiry_min']=float(E['EXP'])
-if E.get('AUTOBE')=='0': cfg['management']['auto_be_after_tp1']=False      # без своего БУ, только по команде канала
+if E.get('AUTOBE') in ('0','1'): cfg['management']['auto_be_after_tp1']=E['AUTOBE']=='1'   # 0 — БУ только по команде канала
 if E.get('BEOFF'): cfg['symbols']['GOLD']['be_offset']=float(E['BEOFF'])    # БУ «с запасом» $X
 if E.get('BENEAR'): cfg['management']['be_near_tp1_usd']=float(E['BENEAR']) # ранний БУ за $X до TP1
 if E.get('HALVE')=='0': cfg['halve_on_risky']=False

@@ -159,6 +159,17 @@ def rules_text():
     rk = CFG.get("risk", {})
     mg = CFG.get("management", {})
     gold = CFG.get("symbols", {}).get("GOLD", {})
+    if rk.get("entry_mode") == "range":
+        # решение владельца 01.11: одно правило, остальные выключены (стоп/тейки и команды канала — само собой)
+        names = {"GOLD": "золото", "BTC": "биткоин"}
+        syms = [names.get(k, k) for k, v in CFG.get("symbols", {}).items() if v.get("enabled")]
+        L = ["📋 Правило:", "• Цена в диапазоне сигнала или лучше → все позиции сразу по рынку",
+             "• Цена хуже диапазона → пропускаю"]
+        if syms:
+            L.append("Инструменты: " + ", ".join(syms))
+        if state.d.get("paused"):
+            L.append("⏸ Сейчас пауза: новые сигналы пропускаю (/resume)")
+        return "\n".join(L)
     L = ["📋 Включённые правила" + (" (🔵 наши):" if len(PROFILES) > 1 else ":")]
     mode = rk.get("entry_mode", "limit")
     if mode == "market":
@@ -329,7 +340,7 @@ async def handle_signal(msg, text, sig, late=False):
     rec = {"id": msg.id, "text": text, "created": time.time(), "symbol_key": sig.symbol, "side": sig.side,
            "zone": list(sig.zone), "tps": {str(k): v for k, v in sig.tps.items()}, "sl": sig.sl,
            "status": "skipped", "orders": [], "be_done": False, "limit_signal": sig.is_limit}
-    head = f"📩 Сигнал #{msg.id}: {sig.describe()}"
+    head = f"📩 #{msg.id} {sig.describe()}"
 
     if not sig.valid:
         rec["status"] = "invalid"
@@ -476,7 +487,19 @@ async def finish_open(rec, sig, orders, rep, head):
         rec["reason"] = rep.replace("не вхожу: ", "").split(" — ")[0][:80]
     state.signals[sid] = rec
     state.save()
-    await notify(head + "\n" + ("✅ " if orders else "ℹ️ ") + rep)
+    if orders:                                   # коротко: как вошли и каким лотом (подробности — в логе)
+        lot = sum(o.get("volume", 0) for o in orders)
+        mk = [o for o in orders if o["kind"] == "market"]
+        if mk:
+            line = f"✅ Вошёл по рынку {sum(o['price'] for o in mk) / len(mk):.2f}, лот {lot:g}"
+        else:
+            line = f"⏳ Лимитка {orders[0]['price']:.2f} (лимитный сигнал канала), лот {lot:g}"
+        if "⚠" in rep or "ошибк" in rep.lower():
+            line += "\n" + rep
+    else:
+        line = "⏭ Пропускаю: " + rep.replace("не вхожу: ", "")
+    log.info("сигнал #%s: %s", sid, rep.replace("\n", " | "))
+    await notify(head + "\n" + line)
 
 
 # ------------------------------------------------------------------ защита (второй слой)
@@ -796,8 +819,10 @@ async def handle_command(msg, text, cmds):
     noop = ("стоп уже в безубытке", "нет открытых позиций", "лимиток нет")
     lines = [l for l in lines if l not in noop]
     if lines:
-        await notify(f"📣 Канал: «{text.strip()[:300]}»\n→ сигнал #{rec['id']} ({how}): "
-                     + ", ".join(c.describe() for c in cmds) + "\n" + "\n".join("• " + l for l in lines))
+        log.info("команда канала → #%s (%s): %s", rec["id"], how, " | ".join(lines))
+        short = lines[:3] + ([f"… ещё {len(lines) - 3}"] if len(lines) > 3 else [])
+        await notify(f"📣 #{rec['id']}: " + ", ".join(c.describe() for c in cmds) + "\n"
+                     + "\n".join("• " + l for l in short))
 
 
 def _plausible(rec, price):
@@ -952,7 +977,7 @@ async def check_signal(rec):
         if filled or n:
             journal_add(rec, pnl)
             cur = trader.account().currency
-            await notify(f"🏁 Сигнал #{rec['id']} — все позиции закрыты. Итог: {pnl:+.2f} {cur}")
+            await notify(f"🏁 #{rec['id']} {rec.get('symbol_key', '')} {rec['side']}: {pnl:+.2f} {cur}")
         return
     if pos and not rec.get("filled"):
         rec["filled"] = True
@@ -988,8 +1013,8 @@ async def check_signal(rec):
         if res:
             what = (f"ранний безубыток: цена почти у TP1 {tp_be:g}" if early else
                     f"цена дошла до {'TP' + str(rec['be_k']) if rec.get('be_k') else 'TP1'} {tp_be:g}")
-            await notify(f"🔒 Сигнал #{rec['id']}: {what} → стоп в безубыток\n"
-                         + "\n".join("• " + l for l in res))
+            log.info("безубыток #%s: %s", rec["id"], " | ".join(res))
+            await notify(f"🔒 #{rec['id']}: {what} → стоп в безубыток")
 
     if pend and pos and reached and not rec.get("be_k"):
         # часть позиций вошла (лесенка/split), цена дошла до TP1 — остальные ордера больше не нужны
@@ -1261,12 +1286,14 @@ async def scheduled_reports():
     def busy_today():                          # в выходные отчёт за день — только если были сигналы/сделки (биткоин)
         t0, t1, _ = period_bounds("day", n)
         return any(t0 <= r["created"] < t1 for r in state.signals.values()) or bool(journal_rows(t0, t1))
-    if (n.weekday() < 5 or busy_today()) and hm >= tuple(map(int, sch.get("daily_at", "23:50").split(":"))) \
-            and state.d.get("rep_day") != today:
+    quiet = CFG["risk"].get("entry_mode") == "range"   # 01.11 «подчисти лишнее»: отчёт дня — только если были сигналы/сделки,
+    #                                                   недельный — суббота «Проверка правил» (tools/weekly), месячный — 1-го
+    if ((busy_today() if quiet else n.weekday() < 5 or busy_today())
+            and hm >= tuple(map(int, sch.get("daily_at", "23:50").split(":"))) and state.d.get("rep_day") != today):
         state.d["rep_day"] = today
         state.save()
         await notify(build_report("day"))
-    if n.weekday() == 4 and hm >= tuple(map(int, sch.get("weekly_at", "23:52").split(":"))) \
+    if not quiet and n.weekday() == 4 and hm >= tuple(map(int, sch.get("weekly_at", "23:52").split(":"))) \
             and state.d.get("rep_week") != today:
         state.d["rep_week"] = today
         state.save()
@@ -1280,11 +1307,17 @@ async def scheduled_reports():
 
 # ------------------------------------------------------------------ команды в «Избранном»
 
-HELP = ("Команды (пишите сюда):\n/status — счёт и открытые сделки\n"
-        "/entry — точка входа в диапазоне сигнала (/entry buy 20, /entry sell 80, /entry 50 — обе)\n/report — отчёт за день (/report week, /report month)\n/pause — не входить в новые сигналы\n"
-        "/resume — снова входить\n/closeall — закрыть ВСЕ сделки копировщика и снять лимитки\n"
-        "/approve, /approve_safe, /reject — решение по сделке, остановленной защитой (если нет кнопок)\n"
-        "/trend — тренд-робот (/trend chart, /trend sell, /trend buy, /trend stop, /trend off, /trend on)\n/help — эта справка")
+def help_text():
+    """Справка: только команды, которые сейчас имеют смысл."""
+    L = ["Команды (пишите сюда):", "/status — счёт и открытые сделки", "/report — отчёт за день (/report week, /report month)",
+         "/pause — не входить в новые сигналы", "/resume — снова входить", "/closeall — закрыть ВСЕ сделки копировщика"]
+    if CFG["risk"].get("entry_mode") != "range":
+        L.insert(2, "/entry — точка входа в диапазоне сигнала (/entry buy 20, /entry sell 80, /entry 50 — обе)")
+    if G.settings(CFG).get("enabled", True):
+        L.append("/approve, /approve_safe, /reject — решение по сделке, остановленной защитой (если нет кнопок)")
+    if TR and TR.p.get("enabled"):
+        L.append("/trend — тренд-робот (/trend chart, /trend sell, /trend buy, /trend stop, /trend off, /trend on)")
+    return "\n".join(L + ["/help — эта справка"])
 
 
 async def handle_user_command(cmd, arg=""):
@@ -1395,7 +1428,7 @@ async def handle_user_command(cmd, arg=""):
         state.save()
         await notify("🧹 Закрыл всё:\n" + ("\n".join("• " + l for l in lines) if lines else "нечего закрывать"))
     else:
-        await notify(HELP)
+        await notify(help_text())
 
 
 # ------------------------------------------------------------------ тренд-робот
@@ -1668,7 +1701,8 @@ async def main():
                  f"Баланс {acc.balance:.2f} {acc.currency}{warn}\n\n"
                  f"{rules_text()}\n\n"
                  + (f"{curator_rules_text()}\n\n" if len(PROFILES) > 1 else "")
-                 + "Точка входа: /entry buy 20, /entry sell 80\n/help — все команды")
+                 + ("" if CFG["risk"].get("entry_mode") == "range" else "Точка входа: /entry buy 20, /entry sell 80\n")
+                 + "/help — все команды")
 
     @client.on(events.NewMessage(chats=channel_entity))
     async def on_new(event):

@@ -80,6 +80,11 @@ def rule_variants(cfg, elb, els):
     """Наши правила, которые проверяем: (ключ, название, переменные прогона без правила, как назвать «без»).
     Новое правило → новая строка здесь (и, если нужно, переменная в tools/backtest/bt3.py)."""
     mg, rk = cfg.get("management") or {}, cfg.get("risk") or {}
+    if rk.get("entry_mode") == "range":
+        # 01.11: одно правило владельца — сравниваем его с прежним входом (лимитка 20/80, ранний БУ, БУ при TP1, ≤2 сигнала)
+        return [("old", "Правило входа (в диапазоне — по рынку, хуже — пропуск)",
+                 {"MODE": "limit", "ELB": "0.2", "ELS": "0.8", "BENEAR": "0.5", "AUTOBE": "1", "MAXACT": "2"},
+                 "по-старому, лимитками")]
     out = []
     near = float(mg.get("be_near_tp1_usd", 0) or 0)
     if near and mg.get("auto_be_after_tp1", True):
@@ -98,6 +103,8 @@ def build_message(today, runs, rules, real, errors):
         L += ["", "💰 Реально на демо-счёте:"]
         for magic, label in MAGICS:
             w, m = real["week"][magic], real["month"][magic]
+            if magic != MAGICS[0][0] and not (w[0] or m[0]):
+                continue                        # выключенные схемы без сделок за месяц — не показываем
             L.append(f"{label}: неделя {pct(w[1])} · месяц {pct(m[1])}")
     L += ["", f"🧪 На истории канала (с {START:%d.%m}, $1000):"]
     for key, label in (("our", "🔵 Наши"), ("cur", "🟠 Куратор")):
@@ -288,7 +295,10 @@ def main():
     elb, els = float(st.get("entry_level_buy", 0.2)), float(st.get("entry_level_sell", 0.8))
     base = {"ELB": str(elb), "ELS": str(els)}
     rules = rule_variants(cfg, elb, els)
-    plan = [("our", base), ("cur", dict(base, PROFILE="cur"))] + [(k, dict(base, **env)) for k, _, env, _ in rules]
+    plan = [("our", base)]
+    if (cfg.get("curator_profile") or {}).get("enabled", True):
+        plan.append(("cur", dict(base, PROFILE="cur")))
+    plan += [(k, dict(base, **env)) for k, _, env, _ in rules]
     runs = {}
     for tag, env in plan:
         try:

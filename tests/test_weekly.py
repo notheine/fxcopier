@@ -59,7 +59,19 @@ def test_rules_and_message():
     assert "✅ Наши правила за последний месяц работают" in ok, ok
 
 
+def test_range_mode():
+    # 01.11: одно правило владельца — сравнение с прежним входом; куратор и тренд без сделок не показываются
+    rules = R.rule_variants({"risk": {"entry_mode": "range"}, "management": {}}, 0.2, 0.8)
+    assert [r[0] for r in rules] == ["old"] and rules[0][2]["MODE"] == "limit"
+    runs = {"our": {"avg_month": 9.5, "month": 3.8, "week": -0.6}, "old": {"avg_month": 4.2, "month": -6.5, "week": -4.6}}
+    real = {"week": {770077: (5.0, 0.8), 770079: (0, 0.0), 770078: (0, 0.0)},
+            "month": {770077: (20.0, 3.3), 770079: (0, 0.0), 770078: (0, 0.0)}}
+    msg = R.build_message(dt.date(2026, 11, 7), runs, rules, real, [])
+    assert "✅ Правило входа" in msg and "по-старому, лимитками −6.5%" in msg, msg
+    assert "🟠" not in msg and "🤖" not in msg and "🔵 Наши: неделя +0.8%" in msg, msg
+
+
 if __name__ == "__main__":
-    for f in (test_metrics, test_verdict, test_real, test_rules_and_message):
+    for f in (test_metrics, test_verdict, test_real, test_rules_and_message, test_range_mode):
         f()
     print("OK")

@@ -170,6 +170,20 @@ def test_entry_modes():
         f = FakeMT5(1000); f.bid = bid
         plan, why = Trader(cfg, f).prepare(5, s2)
         assert plan["action"] == "market" and [k for k, _ in plan["positions"]] == ks and not plan["be_k"], (bid, why)
+    # правило владельца 01.11 (единственное): в диапазоне или лучше — все по рынку; хуже диапазона, за TP1 — пропуск
+    cfg["risk"] = {"entry_mode": "range", "entry_level_buy": 0.2, "after_tp1": "rest"}
+    for bid, act in ((4156.0, "market"), (4157.8, "market"), (4152.0, "market"), (4158.5, None), (4161.0, None),
+                     (4140.5, None)):
+        f = FakeMT5(1000); f.bid = bid                 # ask = bid + 0.15
+        plan, why = Trader(cfg, f).prepare(6, s2)
+        if act:
+            assert plan and plan["action"] == act and [k for k, _ in plan["positions"]] == [1, 2, 3], (bid, why)
+        else:
+            assert plan is None, (bid, why)
+    s3 = parse_signal("RISKY GOLD LIMIT BUY\nlimit buy 4333\n✅TP1: 4355\n✅TP2: 4376\n✅TP3: 4402\n🔴SL: 4309")
+    f = FakeMT5(1000); f.bid = 4340.0                  # лимитный сигнал канала — лимитка на цену из сигнала
+    plan, why = Trader(cfg, f).prepare(7, s3)
+    assert plan and plan["action"] == "limit" and plan["price"] == 4333.0, why
     cfg["risk"] = {"entry_level": 0.2, "below_range": "market"}
     cfg["risk"] = {"entry_level": 0.2, "sl_rule": "cap_tp1"}   # стоп не дальше TP1 (по умолчанию выключено)
     f = FakeMT5(1000); f.bid = 4155.5
